@@ -3,189 +3,367 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <device_launch_parameters.h>
-#include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
-#include "renderer_cuda/cu_renderer_material.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_material.cuh"
 
 /*
 =================================================================================
-Ray-Triangle Intersection (Möller-Trumbore algorithm)
+IntersectTriangleUV
+
+Moller-Trumbore, returns the ray distance and barycentrics only. The hit
+attributes are interpolated once for the closest hit by PT_FillHitAttributes.
 =================================================================================
 */
-__device__ bool IntersectTriangle(
-	const cudaRay_t& ray,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t& triangle,
-	const cudaMaterial_t* materials,
-	cudaHitInfo_t& hitInfo
+__device__ __forceinline__ bool IntersectTriangleUV(
+	const float* orig,
+	const float* dir,
+	const ptVertex_t* vertices,
+	const ptTriangle_t& tri,
+	float& t,
+	float& u,
+	float& v
 ) {
-	const cudaVertex_t& v0 = vertices[triangle.vertexIndices[0]];
-	const cudaVertex_t& v1 = vertices[triangle.vertexIndices[1]];
-	const cudaVertex_t& v2 = vertices[triangle.vertexIndices[2]];
+	const float* p0 = vertices[tri.vertexIndices[0]].position;
+	const float* p1 = vertices[tri.vertexIndices[1]].position;
+	const float* p2 = vertices[tri.vertexIndices[2]].position;
 
-	float edge1[3] = {
-		v1.position[0] - v0.position[0],
-		v1.position[1] - v0.position[1],
-		v1.position[2] - v0.position[2]
-	};
-	float edge2[3] = {
-		v2.position[0] - v0.position[0],
-		v2.position[1] - v0.position[1],
-		v2.position[2] - v0.position[2]
-	};
+	const float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+	const float e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
 
 	float h[3];
-	cross3(ray.direction, edge2, h);
-	float a = dot3(edge1, h);
+	cross3(dir, e2, h);
+	const float a = dot3(e1, h);
+	if (fabsf(a) < 1e-8f) return false;
 
-	if (fabsf(a) < 1e-6f) return false;
-
-	float f = 1.0f / a;
-	float s[3] = {
-		ray.origin[0] - v0.position[0],
-		ray.origin[1] - v0.position[1],
-		ray.origin[2] - v0.position[2]
-	};
-
-	float u = f * dot3(s, h);
+	const float f = 1.0f / a;
+	const float s[3] = { orig[0] - p0[0], orig[1] - p0[1], orig[2] - p0[2] };
+	u = f * dot3(s, h);
 	if (u < 0.0f || u > 1.0f) return false;
 
 	float q[3];
-	cross3(s, edge1, q);
-	float v = f * dot3(ray.direction, q);
+	cross3(s, e1, q);
+	v = f * dot3(dir, q);
 	if (v < 0.0f || u + v > 1.0f) return false;
 
-	float t = f * dot3(edge2, q);
-	if (t > ray.tMin && t < ray.tMax && t < hitInfo.t) {
-		hitInfo.hit = true;
-		hitInfo.t = t;
-
-		hitInfo.position[0] = ray.origin[0] + t * ray.direction[0];
-		hitInfo.position[1] = ray.origin[1] + t * ray.direction[1];
-		hitInfo.position[2] = ray.origin[2] + t * ray.direction[2];
-
-		float w = 1.0f - u - v;
-		hitInfo.normal[0] = w * v0.normal[0] + u * v1.normal[0] + v * v2.normal[0];
-		hitInfo.normal[1] = w * v0.normal[1] + u * v1.normal[1] + v * v2.normal[1];
-		hitInfo.normal[2] = w * v0.normal[2] + u * v1.normal[2] + v * v2.normal[2];
-		normalize3(hitInfo.normal);
-
-		hitInfo.tangent[0] = w * v0.tangent[0] + u * v1.tangent[0] + v * v2.tangent[0];
-		hitInfo.tangent[1] = w * v0.tangent[1] + u * v1.tangent[1] + v * v2.tangent[1];
-		hitInfo.tangent[2] = w * v0.tangent[2] + u * v1.tangent[2] + v * v2.tangent[2];
-		normalize3(hitInfo.tangent);
-
-		hitInfo.binormal[0] = w * v0.binormal[0] + u * v1.binormal[0] + v * v2.binormal[0];
-		hitInfo.binormal[1] = w * v0.binormal[1] + u * v1.binormal[1] + v * v2.binormal[1];
-		hitInfo.binormal[2] = w * v0.binormal[2] + u * v1.binormal[2] + v * v2.binormal[2];
-		normalize3(hitInfo.binormal);
-
-		hitInfo.texcoord[0] = w * v0.texcoord[0] + u * v1.texcoord[0] + v * v2.texcoord[0];
-		hitInfo.texcoord[1] = w * v0.texcoord[1] + u * v1.texcoord[1] + v * v2.texcoord[1];
-
-		hitInfo.barycentrics[0] = w;
-		hitInfo.barycentrics[1] = u;
-		hitInfo.barycentrics[2] = v;
-
-		hitInfo.materialIndex = triangle.materialIndex;
-
-		return true;
-	}
-
-	return false;
+	t = f * dot3(e2, q);
+	return true;
 }
 
 /*
 =================================================================================
-BVH Traversal
+PT_FillHitAttributes
+=================================================================================
+*/
+__device__ void PT_FillHitAttributes(
+	const ptRay_t& ray,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	int triIdx,
+	float t,
+	float u,
+	float v,
+	ptHitInfo_t& hitInfo
+) {
+	const ptTriangle_t& tri = triangles[triIdx];
+	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+	const float w = 1.0f - u - v;
+
+	hitInfo.hit = true;
+	hitInfo.t = t;
+	for (int i = 0; i < 3; i++) {
+		hitInfo.position[i] = ray.origin[i] + t * ray.direction[i];
+		hitInfo.normal[i] = w * v0.normal[i] + u * v1.normal[i] + v * v2.normal[i];
+		hitInfo.tangent[i] = w * v0.tangent[i] + u * v1.tangent[i] + v * v2.tangent[i];
+		hitInfo.binormal[i] = w * v0.binormal[i] + u * v1.binormal[i] + v * v2.binormal[i];
+	}
+	normalize3(hitInfo.normal);
+	normalize3(hitInfo.tangent);
+	normalize3(hitInfo.binormal);
+
+	hitInfo.texcoord[0] = w * v0.texcoord[0] + u * v1.texcoord[0] + v * v2.texcoord[0];
+	hitInfo.texcoord[1] = w * v0.texcoord[1] + u * v1.texcoord[1] + v * v2.texcoord[1];
+
+	hitInfo.barycentrics[0] = w;
+	hitInfo.barycentrics[1] = u;
+	hitInfo.barycentrics[2] = v;
+
+	hitInfo.materialIndex = tri.materialIndex;
+	hitInfo.triangleIndex = triIdx;
+	hitInfo.triFlags = tri.flags;
+}
+
+/*
+=================================================================================
+Slab test helpers
+=================================================================================
+*/
+__device__ __forceinline__ void PT_InvDir(const float* dir, float* invD) {
+	for (int i = 0; i < 3; i++) {
+		// a huge finite value keeps (bound - origin) * invD free of 0 * inf NaNs
+		invD[i] = fabsf(dir[i]) > 1e-12f ? 1.0f / dir[i] : copysignf(1e30f, dir[i]);
+	}
+}
+
+__device__ __forceinline__ bool PT_RayBox(const float* orig, const float* invD, const float* b, float tmin, float tmax) {
+	for (int i = 0; i < 3; i++) {
+		const float t0 = (b[i] - orig[i]) * invD[i];
+		const float t1 = (b[i + 3] - orig[i]) * invD[i];
+		tmin = fmaxf(tmin, fminf(t0, t1));
+		tmax = fminf(tmax, fmaxf(t0, t1));
+	}
+	return tmin <= tmax;
+}
+
+/*
+=================================================================================
+IntersectBVH - closest hit
+
+View weapon handling (the GL renderer draws it with a depth hack, so its
+geometry sits inside walls and floors): PT_TRI_WEAPON triangles are only
+visible to rays with PT_RAY_SEES_WEAPON and then win over any world hit
+within PT_WEAPON_REACH. World triangles closer than ray.worldTMin are
+ignored, which lets rays leaving the weapon escape the geometry it clips.
 =================================================================================
 */
 __device__ bool IntersectBVH(
-	const cudaRay_t& ray,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* nodes,
+	const ptRay_t& ray,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* nodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
-	cudaHitInfo_t& hitInfo
+	const ptMaterial_t* materials,
+	ptHitInfo_t& hitInfo
 ) {
-	bool foundHit = false;
+	float invD[3];
+	PT_InvDir(ray.direction, invD);
 
-	int stack[128];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
+	const bool seesWeapon = (ray.flags & PT_RAY_SEES_WEAPON) != 0;
+	const float worldMin = fmaxf(ray.tMin, ray.worldTMin);
+	const float weaponMax = fminf(ray.tMax, PT_WEAPON_REACH);
 
-	while (stackPtr > 0 && stackPtr < 128) {
-		int nodeIndex = stack[--stackPtr];
-		const cudaBVHNode_t& node = nodes[nodeIndex];
+	float bestT = ray.tMax;
+	float bestU = 0.0f, bestV = 0.0f;
+	int bestTri = -1;
+	bool bestWeapon = false;
 
-		float tmin = ray.tMin;
-		float tmax = foundHit ? hitInfo.t : ray.tMax;
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = nodes[nodeIdx];
 
-		for (int i = 0; i < 3; i++) {
-			if (fabsf(ray.direction[i]) < 1e-6f) {
-				if (ray.origin[i] < node.bounds[i] || ray.origin[i] > node.bounds[i + 3]) {
-					goto skip_node;
-				}
+		const float cullT = (seesWeapon && !bestWeapon) ? fmaxf(bestT, weaponMax) : bestT;
+		if (!PT_RayBox(ray.origin, invD, node.bounds, ray.tMin, cullT)) {
+			nodeIdx = node.escapeIndex;
+			continue;
+		}
+
+		if (node.leftChild != -1) {
+			nodeIdx = node.leftChild;
+			continue;
+		}
+
+		for (int i = node.firstPrimitive; i < node.firstPrimitive + node.primitiveCount; i++) {
+			const int triIdx = triIndices[i];
+			const ptTriangle_t& tri = triangles[triIdx];
+			const bool isWeapon = (tri.flags & PT_TRI_WEAPON) != 0;
+			if (isWeapon ? !seesWeapon : bestWeapon) {
 				continue;
 			}
 
-			float invD = 1.0f / ray.direction[i];
-			float t0 = (node.bounds[i] - ray.origin[i]) * invD;
-			float t1 = (node.bounds[i + 3] - ray.origin[i]) * invD;
-
-			if (invD < 0.0f) {
-				float tmp = t0; t0 = t1; t1 = tmp;
+			float t, u, v;
+			if (!IntersectTriangleUV(ray.origin, ray.direction, vertices, tri, t, u, v)) {
+				continue;
 			}
 
-			tmin = fmaxf(tmin, t0);
-			tmax = fminf(tmax, t1);
-
-			if (tmax <= tmin) goto skip_node;
+			if (isWeapon) {
+				if (t <= ray.tMin || t >= weaponMax || (bestWeapon && t >= bestT)) continue;
+				bestWeapon = true;
+			} else if (t <= worldMin || t >= bestT) {
+				continue;
+			}
+			bestT = t;
+			bestU = u;
+			bestV = v;
+			bestTri = triIdx;
 		}
-
-		if (node.leftChild == -1) {
-			for (int i = node.firstPrimitive; i < node.firstPrimitive + node.primitiveCount; i++) {
-				int triIdx = triIndices[i];
-				if (IntersectTriangle(ray, vertices, triangles[triIdx], materials, hitInfo)) {
-					hitInfo.triangleIndex = triIdx;
-					foundHit = true;
-				}
-			}
-		} else {
-			if (stackPtr <= 126) {
-				const cudaBVHNode_t& leftNode = nodes[node.leftChild];
-				const cudaBVHNode_t& rightNode = nodes[node.rightChild];
-
-				float leftDot =
-					((leftNode.bounds[0] + leftNode.bounds[3]) - 2.0f * ray.origin[0]) * ray.direction[0] +
-					((leftNode.bounds[1] + leftNode.bounds[4]) - 2.0f * ray.origin[1]) * ray.direction[1] +
-					((leftNode.bounds[2] + leftNode.bounds[5]) - 2.0f * ray.origin[2]) * ray.direction[2];
-				float rightDot =
-					((rightNode.bounds[0] + rightNode.bounds[3]) - 2.0f * ray.origin[0]) * ray.direction[0] +
-					((rightNode.bounds[1] + rightNode.bounds[4]) - 2.0f * ray.origin[1]) * ray.direction[1] +
-					((rightNode.bounds[2] + rightNode.bounds[5]) - 2.0f * ray.origin[2]) * ray.direction[2];
-
-				if (leftDot < rightDot) {
-					stack[stackPtr++] = node.rightChild;
-					stack[stackPtr++] = node.leftChild;
-				} else {
-					stack[stackPtr++] = node.leftChild;
-					stack[stackPtr++] = node.rightChild;
-				}
-			}
-		}
-
-		skip_node:;
+		nodeIdx = node.escapeIndex;
 	}
 
-	return foundHit;
+	if (bestTri < 0) {
+		return false;
+	}
+	PT_FillHitAttributes(ray, vertices, triangles, bestTri, bestT, bestU, bestV, hitInfo);
+	return true;
+}
+
+/*
+=================================================================================
+PT_ApplyTexTransform
+=================================================================================
+*/
+__device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& material, float& tu, float& tv) {
+	const float* xf = material.texTransform;
+	if (xf[0] == 1.0f && xf[1] == 0.0f && xf[2] == 0.0f
+		&& xf[3] == 0.0f && xf[4] == 1.0f && xf[5] == 0.0f) {
+		return;
+	}
+	const float u = xf[0] * tu + xf[1] * tv + xf[2];
+	const float v = xf[3] * tu + xf[4] * tv + xf[5];
+	tu = u;
+	tv = v;
+	tu = tu - floorf(tu);
+	tv = tv - floorf(tv);
+}
+
+__device__ __forceinline__ void PT_ApplyVertexColor(
+	const ptMaterial_t& material, const ptVertex_t* vertices, const ptTriangle_t& tri,
+	float w, float u, float v, float* color
+) {
+	if (!material.useVertexColor) return;
+	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+	for (int c = 0; c < 4; c++) {
+		const float vertexColor = w * v0.color[c] + u * v1.color[c] + v * v2.color[c];
+		color[c] *= c < 3 ? PT_SrgbToLinear(vertexColor) : vertexColor;
+	}
+}
+
+/*
+=================================================================================
+PT_ShadowTransmit
+
+Filters a shadow ray through a non-opaque surface. Returns false when the
+surface blocks the ray.
+=================================================================================
+*/
+__device__ bool PT_ShadowTransmit(
+	const float* dir,
+	const ptVertex_t* vertices,
+	const ptTriangle_t& tri,
+	float u,
+	float v,
+	const ptMaterial_t* materials,
+	const cudaTexture_t* textures,
+	float* atten
+) {
+	const ptMaterial_t& m = materials[tri.materialIndex];
+	if (m.noShadows || m.isAmbientOnly || m.blendMode == PT_BLEND_ADD) {
+		return true;
+	}
+
+	float tex[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+	if (m.albedoTexture >= 0 && textures) {
+		const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+		const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+		const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+		const float w = 1.0f - u - v;
+		float tu = w * v0.texcoord[0] + u * v1.texcoord[0] + v * v2.texcoord[0];
+		float tv = w * v0.texcoord[1] + u * v1.texcoord[1] + v * v2.texcoord[1];
+		PT_ApplyTexTransform(m, tu, tv);
+		SampleTextureSrgb(textures, m.albedoTexture, tu, tv, tex);
+	}
+	PT_ApplyVertexColor(m, vertices, tri, 1.0f - u - v, u, v, tex);
+	const float alpha = m.albedo[3] * tex[3];
+
+	if (m.alphaTest > 0.0f && alpha < m.alphaTest) {
+		return true;
+	}
+
+	if (m.transmission > 0.0f) {
+		const float* p0 = vertices[tri.vertexIndices[0]].position;
+		const float* p1 = vertices[tri.vertexIndices[1]].position;
+		const float* p2 = vertices[tri.vertexIndices[2]].position;
+		const float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
+		const float e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
+		float n[3];
+		cross3(e1, e2, n);
+		normalize3(n);
+
+		const float cosT = fabsf(dot3(n, dir));
+		float r0 = (m.ior - 1.0f) / (m.ior + 1.0f);
+		r0 = r0 * r0;
+		const float fresnel = r0 + (1.0f - r0) * powf(1.0f - cosT, 5.0f);
+		const float transmitFrac = (1.0f - fresnel) * m.transmission;
+		for (int c = 0; c < 3; c++) {
+			atten[c] *= transmitFrac * m.albedo[c] * tex[c];
+		}
+	} else if (m.blendMode == PT_BLEND_ALPHA) {
+		const float transmit = 1.0f - fminf(alpha, 1.0f);
+		atten[0] *= transmit;
+		atten[1] *= transmit;
+		atten[2] *= transmit;
+	} else {
+		return false;
+	}
+
+	return atten[0] >= 0.01f || atten[1] >= 0.01f || atten[2] >= 0.01f;
+}
+
+/*
+=================================================================================
+TraceShadow - any hit visibility with colored transmission
+
+Returns false when the segment [max(tMin, worldTMin), tMax] is blocked,
+otherwise atten holds the product of the transmittance of every
+translucent surface along it. Weapon triangles never cast shadows.
+=================================================================================
+*/
+__device__ bool TraceShadow(
+	const ptRay_t& ray,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* nodes,
+	const int* triIndices,
+	const ptMaterial_t* materials,
+	const cudaTexture_t* textures,
+	float* atten
+) {
+	atten[0] = atten[1] = atten[2] = 1.0f;
+
+	float invD[3];
+	PT_InvDir(ray.direction, invD);
+	const float tMin = fmaxf(ray.tMin, ray.worldTMin);
+
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = nodes[nodeIdx];
+		if (!PT_RayBox(ray.origin, invD, node.bounds, tMin, ray.tMax)) {
+			nodeIdx = node.escapeIndex;
+			continue;
+		}
+
+		if (node.leftChild != -1) {
+			nodeIdx = node.leftChild;
+			continue;
+		}
+
+		for (int i = node.firstPrimitive; i < node.firstPrimitive + node.primitiveCount; i++) {
+			const ptTriangle_t& tri = triangles[triIndices[i]];
+			if (tri.flags & (PT_TRI_WEAPON | PT_TRI_NO_OCCLUDE)) {
+				continue;
+			}
+
+			float t, u, v;
+			if (!IntersectTriangleUV(ray.origin, ray.direction, vertices, tri, t, u, v) || t <= tMin || t >= ray.tMax) {
+				continue;
+			}
+			if (tri.flags & PT_TRI_OPAQUE) {
+				return false;
+			}
+			if (!PT_ShadowTransmit(ray.direction, vertices, tri, u, v, materials, textures, atten)) {
+				return false;
+			}
+		}
+		nodeIdx = node.escapeIndex;
+	}
+
+	return true;
 }
 
 // include sampling after intersection is defined (sampling calls IntersectBVH)
-#include "renderer_cuda/cu_renderer_sampling.cuh"
+#include "renderer_pt/cuda/pt_cuda_sampling.cuh"
 
 /*
 =================================================================================
@@ -193,47 +371,18 @@ PathTracingKernel - Full PBR path tracing
 =================================================================================
 */
 __global__ void PathTracingKernel(
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	int width,
-	int height,
-	const float* cameraPos,
-	const float* cameraForward,
-	const float* cameraRight,
-	const float* cameraUp,
-	float fov,
-	float fovY,
-	int samplesPerPixel,
-	int maxDepth,
-	int maxLightSamples,
-	int frameIndex,
-	float emissionBoost,
-	float indirectProb,
-	int rrEnabled,
-	int rrMinBounces,
-	float rrSurvivalMin,
-	float earlyTermThreshold,
-	float fireflyClamp,
-	float throughputClamp,
-	float rayOffset,
-	float specularBoost,
-	float skyIntensity,
-	const float* skyColorZenith,
-	const float* skyColorHorizon,
-	const float* skyColorGround,
-	float volumetricDensity,
-	int volumetricSteps,
-	float volumetricAnisotropy,
-	float volFalloff,
-	float volMaxDist
+	const ptRenderParams_t params
 ) {
+	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -241,25 +390,23 @@ __global__ void PathTracingKernel(
 
 	int pixelIndex = (y * width + x) * 4;
 
-	// per-pixel RNG with curand
-	unsigned long long pixelSeed = (unsigned long long)(y * width + x) * 1000003ULL + (unsigned long long)frameIndex * 999983ULL;
-	curandState randState;
-	curand_init(pixelSeed, 0, 0, &randState);
+	ptRng_t rng;
+	PT_RngInit(&rng, (unsigned int)(y * width + x), (unsigned int)frameIndex);
 
 	float color[3] = { 0.0f, 0.0f, 0.0f };
 
 	for (int sample = 0; sample < samplesPerPixel; sample++) {
 		// primary ray with jitter
-		float jitterX = curand_uniform(&randState) - 0.5f;
-		float jitterY = curand_uniform(&randState) - 0.5f;
+		float jitterX = PT_Rand(&rng) - 0.5f;
+		float jitterY = PT_Rand(&rng) - 0.5f;
 
 		float u = ((float)(x) + 0.5f + jitterX) / (float)width * 2.0f - 1.0f;
 		float v = ((float)(y) + 0.5f + jitterY) / (float)height * 2.0f - 1.0f;
 
-		float tanHalfFovX = tanf(fov * (float)M_PI / 360.0f);
-		float tanHalfFovY = tanf(fovY * (float)M_PI / 360.0f);
+		float tanHalfFovX = tanf(fov * PT_PI / 360.0f);
+		float tanHalfFovY = tanf(fovY * PT_PI / 360.0f);
 
-		cudaRay_t ray;
+		ptRay_t ray;
 		ray.origin[0] = cameraPos[0];
 		ray.origin[1] = cameraPos[1];
 		ray.origin[2] = cameraPos[2];
@@ -271,14 +418,17 @@ __global__ void PathTracingKernel(
 
 		ray.tMin = rayOffset;
 		ray.tMax = 1e10f;
+		ray.worldTMin = 0.0f;
+		ray.flags = PT_RAY_SEES_WEAPON;
 
 		float pathThroughput[3] = { 1.0f, 1.0f, 1.0f };
 		float pathRadiance[3] = { 0.0f, 0.0f, 0.0f };
+		bool lastSampledLights = false;
 
 		int depth = 0;
 		const int maxTransparentPasses = maxDepth * 8;  // generous budget for overlapping particles/decals
 		for (int iteration = 0; iteration < maxTransparentPasses && depth < maxDepth; iteration++) {
-			cudaHitInfo_t hitInfo;
+			ptHitInfo_t hitInfo;
 			hitInfo.hit = false;
 			hitInfo.t = ray.tMax;
 			hitInfo.materialIndex = 0;
@@ -310,7 +460,14 @@ __global__ void PathTracingKernel(
 				break;
 			}
 
-			const cudaMaterial_t& material = materials[hitInfo.materialIndex];
+			// pass-through continuations restart at the hit, keep the clearance where it was
+			ray.worldTMin = fmaxf(0.0f, ray.worldTMin - hitInfo.t);
+
+			const ptMaterial_t& material = materials[hitInfo.materialIndex];
+
+			// rays leaving the view weapon skip the world geometry it pokes into
+			const bool hitWeapon = (hitInfo.triFlags & PT_TRI_WEAPON) != 0;
+			const float shadeWorldTMin = hitWeapon ? PT_WEAPON_CLEARANCE : 0.0f;
 
 			// ---------------------------------------------------------------
 			// Apply texture transforms to UV
@@ -318,34 +475,14 @@ __global__ void PathTracingKernel(
 			float tu = hitInfo.texcoord[0];
 			float tv = hitInfo.texcoord[1];
 
-			bool hasTransform = (material.texTransform[0] != 1.0f || material.texTransform[1] != 1.0f ||
-								material.texTransform[2] != 0.0f || material.texTransform[3] != 0.0f ||
-								material.texTransform[4] != 0.0f);
-
-			if (hasTransform) {
-				tu *= material.texTransform[0];
-				tv *= material.texTransform[1];
-				if (material.texTransform[2] != 0.0f) {
-					float angle = material.texTransform[2];
-					float cosA = cosf(angle);
-					float sinA = sinf(angle);
-					float uRot = tu * cosA - tv * sinA;
-					float vRot = tu * sinA + tv * cosA;
-					tu = uRot;
-					tv = vRot;
-				}
-				tu += material.texTransform[3];
-				tv += material.texTransform[4];
-				tu = tu - floorf(tu);
-				tv = tv - floorf(tv);
-			}
+			PT_ApplyTexTransform(material, tu, tv);
 
 			// ---------------------------------------------------------------
 			// Sample albedo texture
 			// ---------------------------------------------------------------
 			float albedo[4];
 			if (material.albedoTexture >= 0 && textures) {
-				SampleTexture(textures, material.albedoTexture, tu, tv, albedo);
+				SampleTextureSrgb(textures, material.albedoTexture, tu, tv, albedo);
 				albedo[0] *= material.albedo[0];
 				albedo[1] *= material.albedo[1];
 				albedo[2] *= material.albedo[2];
@@ -430,27 +567,8 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			// Vertex color
 			// ---------------------------------------------------------------
-			if (material.useVertexColor) {
-				const cudaTriangle_t& tri = triangles[hitInfo.triangleIndex];
-				const cudaVertex_t& vert0 = vertices[tri.vertexIndices[0]];
-				const cudaVertex_t& vert1 = vertices[tri.vertexIndices[1]];
-				const cudaVertex_t& vert2 = vertices[tri.vertexIndices[2]];
-
-				float bw = hitInfo.barycentrics[0];
-				float bu = hitInfo.barycentrics[1];
-				float bv = hitInfo.barycentrics[2];
-
-				float vertexColor[4];
-				vertexColor[0] = bw * vert0.color[0] + bu * vert1.color[0] + bv * vert2.color[0];
-				vertexColor[1] = bw * vert0.color[1] + bu * vert1.color[1] + bv * vert2.color[1];
-				vertexColor[2] = bw * vert0.color[2] + bu * vert1.color[2] + bv * vert2.color[2];
-				vertexColor[3] = bw * vert0.color[3] + bu * vert1.color[3] + bv * vert2.color[3];
-
-				albedo[0] *= vertexColor[0];
-				albedo[1] *= vertexColor[1];
-				albedo[2] *= vertexColor[2];
-				albedo[3] *= vertexColor[3];
-			}
+			PT_ApplyVertexColor(material, vertices, triangles[hitInfo.triangleIndex],
+				hitInfo.barycentrics[0], hitInfo.barycentrics[1], hitInfo.barycentrics[2], albedo);
 
 			// ---------------------------------------------------------------
 			// Alpha test: skip transparent fragments
@@ -490,19 +608,18 @@ __global__ void PathTracingKernel(
 				}
 
 				// light the decal overlay
-				if (numLights > 0) {
-					int numSamples = min(numLights, maxLightSamples);
-					float lightWeight = (float)numLights / (float)numSamples;
-					for (int i = 0; i < numSamples; i++) {
-						int lightIndex = (int)(curand_uniform(&randState) * numLights);
-						if (lightIndex >= numLights) lightIndex = numLights - 1;
-						float directLight[3];
-						SampleDirectLight(lights[lightIndex], hitInfo.position, surfaceNormal,
-							vertices, triangles, bvhNodes, triIndices, materials, textures, &randState, directLight);
-						pathRadiance[0] += pathThroughput[0] * directLight[0] * albedo[0] * alpha * lightWeight;
-						pathRadiance[1] += pathThroughput[1] * directLight[1] * albedo[1] * alpha * lightWeight;
-						pathRadiance[2] += pathThroughput[2] * directLight[2] * albedo[2] * alpha * lightWeight;
-					}
+				int picks[PT_MAX_LIGHT_PICKS];
+				float pickWeights[PT_MAX_LIGHT_PICKS];
+				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
+				for (int i = 0; i < numPicks; i++) {
+					float directLight[3], wi[3];
+					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
+						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
+					const float w = alpha * pickWeights[i];
+					pathRadiance[0] += pathThroughput[0] * directLight[0] * albedo[0] * w;
+					pathRadiance[1] += pathThroughput[1] * directLight[1] * albedo[1] * w;
+					pathRadiance[2] += pathThroughput[2] * directLight[2] * albedo[2] * w;
 				}
 
 				pathRadiance[0] += pathThroughput[0] * material.emission[0] * emissionBoost * alpha;
@@ -588,7 +705,7 @@ __global__ void PathTracingKernel(
 				float fresnel = r0 + (1.0f - r0) * powf(1.0f - cosTheta, 5.0f);
 				float reflectProb = fresnel + (1.0f - fresnel) * (1.0f - material.transmission);
 
-				if (curand_uniform(&randState) > reflectProb) {
+				if (PT_Rand(&rng) > reflectProb) {
 					// transmit through
 					pathThroughput[0] *= albedo[0];
 					pathThroughput[1] *= albedo[1];
@@ -604,44 +721,43 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			// Emission
 			// ---------------------------------------------------------------
-			pathRadiance[0] += pathThroughput[0] * material.emission[0] * emissionBoost;
-			pathRadiance[1] += pathThroughput[1] * material.emission[1] * emissionBoost;
-			pathRadiance[2] += pathThroughput[2] * material.emission[2] * emissionBoost;
+			// skip emitters the previous bounce's light sampling already covered
+			if (depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !lastSampledLights) {
+				float glow[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+				if (material.emissionTexture >= 0 && textures) {
+					SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
+				}
+				pathRadiance[0] += pathThroughput[0] * material.emission[0] * glow[0] * emissionBoost;
+				pathRadiance[1] += pathThroughput[1] * material.emission[1] * glow[1] * emissionBoost;
+				pathRadiance[2] += pathThroughput[2] * material.emission[2] * glow[2] * emissionBoost;
+			}
 
 			// ---------------------------------------------------------------
 			// Direct light sampling with PBR BRDF
 			// ---------------------------------------------------------------
-			if (numLights > 0) {
-				int numSamples = min(numLights, maxLightSamples);
-				float lightWeight = (float)numLights / (float)numSamples;
+			bool sampledLights = false;
+			{
+				int picks[PT_MAX_LIGHT_PICKS];
+				float pickWeights[PT_MAX_LIGHT_PICKS];
+				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
+				sampledLights = numPicks > 0;
 
-				for (int i = 0; i < numSamples; i++) {
-					int lightIndex = (int)(curand_uniform(&randState) * numLights);
-					if (lightIndex >= numLights) lightIndex = numLights - 1;
+				for (int i = 0; i < numPicks; i++) {
+					float directLight[3], wi[3];
+					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
+						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
+					if (directLight[0] + directLight[1] + directLight[2] <= 0.0f) {
+						continue;
+					}
 
-					float directLight[3];
-					SampleDirectLight(lights[lightIndex], hitInfo.position, surfaceNormal,
-						vertices, triangles, bvhNodes, triIndices, materials, textures, &randState, directLight);
-
-					if (material.blendMode == 0 || material.blendMode == 1) {
-						// compute light direction for PBR BRDF evaluation
-						float wi[3];
-						if (lights[lightIndex].type == 1) {
-							wi[0] = -lights[lightIndex].direction[0];
-							wi[1] = -lights[lightIndex].direction[1];
-							wi[2] = -lights[lightIndex].direction[2];
-						} else {
-							wi[0] = lights[lightIndex].position[0] - hitInfo.position[0];
-							wi[1] = lights[lightIndex].position[1] - hitInfo.position[1];
-							wi[2] = lights[lightIndex].position[2] - hitInfo.position[2];
-						}
-						normalize3(wi);
-
+					const float lightWeight = pickWeights[i];
+					if (material.blendMode == PT_BLEND_OPAQUE || material.blendMode == PT_BLEND_ALPHA) {
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 						float directBrdf[3];
 						EvaluatePBRMaterial(albedo, surfaceNormal, wo, wi, metallic, roughness, specularBoost, specColor, directBrdf);
 
-						float alphaScale = (material.blendMode == 1) ? albedo[3] : 1.0f;
+						float alphaScale = (material.blendMode == PT_BLEND_ALPHA) ? albedo[3] : 1.0f;
 						pathRadiance[0] += pathThroughput[0] * directLight[0] * directBrdf[0] * alphaScale * lightWeight;
 						pathRadiance[1] += pathThroughput[1] * directLight[1] * directBrdf[1] * alphaScale * lightWeight;
 						pathRadiance[2] += pathThroughput[2] * directLight[2] * directBrdf[2] * alphaScale * lightWeight;
@@ -651,42 +767,49 @@ __global__ void PathTracingKernel(
 						pathRadiance[1] += pathThroughput[1] * directLight[1] * albedo[1] * lightWeight;
 						pathRadiance[2] += pathThroughput[2] * directLight[2] * albedo[2] * lightWeight;
 					}
+				}
+			}
 
-					// -------------------------------------------------------
-					// Volumetric scattering
-					// -------------------------------------------------------
-					if (depth < 2 && lights[lightIndex].volumetric > 0.0f) {
-						float volumetric[3];
-						float rayLen = hitInfo.t;
-						float rayDir[3] = { ray.direction[0], ray.direction[1], ray.direction[2] };
-						float rayOrg[3] = { ray.origin[0], ray.origin[1], ray.origin[2] };
-
-						SampleVolumetricScattering(lights[lightIndex], rayOrg, rayDir, rayLen,
-							vertices, triangles, bvhNodes, triIndices, materials, textures, &randState, volumetric,
-							volumetricDensity, volumetricSteps, volumetricAnisotropy, volFalloff, volMaxDist);
-
-						pathRadiance[0] += pathThroughput[0] * volumetric[0] * lightWeight;
-						pathRadiance[1] += pathThroughput[1] * volumetric[1] * lightWeight;
-						pathRadiance[2] += pathThroughput[2] * volumetric[2] * lightWeight;
+			// ---------------------------------------------------------------
+			// Volumetric scattering along the segment that reached this hit.
+			// Uniform light picks: importance at the surface says nothing
+			// about the lights the segment passes through.
+			// ---------------------------------------------------------------
+			if (depth < 2 && volumetricDensity > 0.0f && numLights > 0) {
+				const int numSamples = min(numLights, maxLightSamples);
+				const float lightWeight = (float)numLights / (float)numSamples;
+				for (int i = 0; i < numSamples; i++) {
+					const int lightIndex = min((int)(PT_Rand(&rng) * numLights), numLights - 1);
+					if (lights[lightIndex].volumetric <= 0.0f) {
+						continue;
 					}
+					float volumetric[3];
+					SampleVolumetricScattering(lights[lightIndex], ray.origin, ray.direction, hitInfo.t,
+						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, volumetric,
+						volumetricDensity, volumetricSteps, volumetricAnisotropy, volFalloff, volMaxDist);
+
+					pathRadiance[0] += pathThroughput[0] * volumetric[0] * lightWeight;
+					pathRadiance[1] += pathThroughput[1] * volumetric[1] * lightWeight;
+					pathRadiance[2] += pathThroughput[2] * volumetric[2] * lightWeight;
 				}
 			}
 
 			// No ambient fill — Doom 3 scenes are lit exclusively by placed lights.
 
 			// ---------------------------------------------------------------
-			// Indirect lighting (one-bounce GI)
+			// Indirect lighting (one-bounce GI), only for single bounce
+			// paths: deeper paths already continue into the same bounce
 			// ---------------------------------------------------------------
-			if (depth == 0 && indirectProb > 0.0f && curand_uniform(&randState) < indirectProb) {
+			if (depth == 0 && maxDepth <= 1 && indirectProb > 0.0f && PT_Rand(&rng) < indirectProb) {
 				float indirectDir[3];
 				float indirectPdf;
-				SampleHemisphere(surfaceNormal, &randState, indirectDir, indirectPdf);
+				SampleHemisphere(surfaceNormal, &rng, indirectDir, indirectPdf);
 
 				if (indirectPdf > 1e-6f) {
 					float indirectLight[3];
-					SampleIndirectLight(hitInfo.position, surfaceNormal, indirectDir,
+					SampleIndirectLight(hitInfo.position, surfaceNormal, indirectDir, shadeWorldTMin, emissionBoost, sampledLights,
 						vertices, triangles, bvhNodes, triIndices, materials, textures,
-						lights, numLights, &randState, indirectLight);
+						lights, numLights, &rng, indirectLight);
 
 					if (!isfinite(indirectLight[0])) indirectLight[0] = 0.0f;
 					if (!isfinite(indirectLight[1])) indirectLight[1] = 0.0f;
@@ -720,10 +843,17 @@ __global__ void PathTracingKernel(
 			}
 
 			// ---------------------------------------------------------------
-			// Throughput early termination
+			// Low throughput roulette (unbiased replacement for a hard cut)
 			// ---------------------------------------------------------------
-			if (throughputClamp > 0.0f && pathThroughput[0] < throughputClamp && pathThroughput[1] < throughputClamp && pathThroughput[2] < throughputClamp) {
-				break;
+			if (throughputClamp > 0.0f) {
+				const float maxThroughput = fmaxf(pathThroughput[0], fmaxf(pathThroughput[1], pathThroughput[2]));
+				if (maxThroughput < throughputClamp) {
+					const float survival = maxThroughput / throughputClamp;
+					if (PT_Rand(&rng) >= survival) break;
+					pathThroughput[0] /= survival;
+					pathThroughput[1] /= survival;
+					pathThroughput[2] /= survival;
+				}
 			}
 
 			// alpha blend pass-through for semi-transparent surfaces
@@ -748,7 +878,7 @@ __global__ void PathTracingKernel(
 			if (rrEnabled && depth >= rrMinBounces) {
 				float maxThroughput = fmaxf(pathThroughput[0], fmaxf(pathThroughput[1], pathThroughput[2]));
 				float survivalProb = fminf(0.95f, fmaxf(rrSurvivalMin, maxThroughput));
-				if (curand_uniform(&randState) > survivalProb) {
+				if (PT_Rand(&rng) > survivalProb) {
 					break;
 				}
 				float invProb = 1.0f / survivalProb;
@@ -757,10 +887,16 @@ __global__ void PathTracingKernel(
 				pathThroughput[2] *= invProb;
 			}
 
-			// early termination
+			// early termination roulette
 			if (earlyTermThreshold > 0.0f) {
-				float maxThroughput = fmaxf(pathThroughput[0], fmaxf(pathThroughput[1], pathThroughput[2]));
-				if (maxThroughput < earlyTermThreshold) break;
+				const float maxThroughput = fmaxf(pathThroughput[0], fmaxf(pathThroughput[1], pathThroughput[2]));
+				if (maxThroughput < earlyTermThreshold) {
+					const float survival = maxThroughput / earlyTermThreshold;
+					if (PT_Rand(&rng) >= survival) break;
+					pathThroughput[0] /= survival;
+					pathThroughput[1] /= survival;
+					pathThroughput[2] /= survival;
+				}
 			}
 
 			// ---------------------------------------------------------------
@@ -768,7 +904,7 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			float nextDir[3];
 			float pdf;
-			SampleHemisphere(surfaceNormal, &randState, nextDir, pdf);
+			SampleHemisphere(surfaceNormal, &rng, nextDir, pdf);
 
 			if (pdf < 1e-6f) break;
 
@@ -792,6 +928,8 @@ __global__ void PathTracingKernel(
 				break;
 			}
 
+			lastSampledLights = sampledLights;
+
 			// next ray from surface
 			ray.origin[0] = hitInfo.position[0] + surfaceNormal[0] * rayOffset;
 			ray.origin[1] = hitInfo.position[1] + surfaceNormal[1] * rayOffset;
@@ -801,6 +939,8 @@ __global__ void PathTracingKernel(
 			ray.direction[2] = nextDir[2];
 			ray.tMin = rayOffset;
 			ray.tMax = 1e10f;
+			ray.worldTMin = shadeWorldTMin;
+			ray.flags = 0;
 
 		}  // end bounce loop
 
@@ -827,10 +967,12 @@ __global__ void PathTracingKernel(
 		color[0] = color[1] = color[2] = 0.0f;
 	}
 
-	// additive temporal accumulation
-	framebuffer[pixelIndex + 0] += color[0];
-	framebuffer[pixelIndex + 1] += color[1];
-	framebuffer[pixelIndex + 2] += color[2];
+	// Running mean avoids the precision loss of an ever-growing frame sum.
+	const float oldWeight = (float)frameIndex;
+	const float newWeight = 1.0f / (oldWeight + 1.0f);
+	framebuffer[pixelIndex + 0] += (color[0] - framebuffer[pixelIndex + 0]) * newWeight;
+	framebuffer[pixelIndex + 1] += (color[1] - framebuffer[pixelIndex + 1]) * newWeight;
+	framebuffer[pixelIndex + 2] += (color[2] - framebuffer[pixelIndex + 2]) * newWeight;
 	framebuffer[pixelIndex + 3] = 1.0f;
 }
 
@@ -846,8 +988,7 @@ __global__ void ToneMappingKernel(
 	int height,
 	float exposure,
 	float gamma,
-	int toneMapMode,
-	int frameCount
+	int toneMapMode
 ) {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -856,10 +997,9 @@ __global__ void ToneMappingKernel(
 
 	int pixelIndex = (y * width + x) * 4;
 
-	float invFrameCount = 1.0f / fmaxf(1.0f, (float)frameCount);
-	float r = hdrBuffer[pixelIndex + 0] * invFrameCount;
-	float g = hdrBuffer[pixelIndex + 1] * invFrameCount;
-	float b = hdrBuffer[pixelIndex + 2] * invFrameCount;
+	float r = hdrBuffer[pixelIndex + 0];
+	float g = hdrBuffer[pixelIndex + 1];
+	float b = hdrBuffer[pixelIndex + 2];
 
 	// apply exposure
 	r *= exposure;

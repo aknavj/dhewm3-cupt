@@ -57,12 +57,16 @@ public:
 	void					UpdateCheat( void );
 	void					Set( const char *newValue, bool force, bool fromServer );
 	void					Reset( void );
+	void					AddChangeCallback( cvarChangeCallback_t callback );
 
 private:
+	void					NotifyChange( void );
+
 	idStr					nameString;				// name
 	idStr					resetString;			// resetting will change to this value
 	idStr					valueString;			// value
 	idStr					descriptionString;		// description
+	idList<cvarChangeCallback_t> changeCallbacks;
 
 	virtual void			InternalSetString( const char *newValue );
 	virtual void			InternalServerSetString( const char *newValue );
@@ -354,6 +358,7 @@ void idInternalCVar::Set( const char *newValue, bool force, bool fromServer ) {
 
 	SetModified();
 	cvarSystem->SetModifiedFlags( flags );
+	NotifyChange();
 }
 
 /*
@@ -362,9 +367,33 @@ idInternalCVar::Reset
 ============
 */
 void idInternalCVar::Reset( void ) {
+	const bool hasCallbacks = changeCallbacks.Num() > 0;
+	idStr previousValue;
+	if ( hasCallbacks ) {
+		previousValue = valueString;
+	}
 	valueString = resetString;
 	value = valueString.c_str();
 	UpdateValue();
+	// Preserve the existing reset behavior for CVars without listeners.
+	if ( hasCallbacks && valueString.Cmp( previousValue ) != 0 ) {
+		SetModified();
+		cvarSystem->SetModifiedFlags( flags );
+		NotifyChange();
+	}
+}
+
+void idInternalCVar::AddChangeCallback( cvarChangeCallback_t callback ) {
+	if ( changeCallbacks.FindIndex( callback ) < 0 ) {
+		changeCallbacks.Append( callback );
+	}
+}
+
+void idInternalCVar::NotifyChange( void ) {
+	const int count = changeCallbacks.Num();
+	for ( int i = 0; i < count; i++ ) {
+		changeCallbacks[i]( *this );
+	}
 }
 
 /*
@@ -491,6 +520,15 @@ idCVarSystemLocal			localCVarSystem;
 idCVarSystem *				cvarSystem = &localCVarSystem;
 
 idDict						idCVarSystemLocal::moveCVarsToDict;
+
+bool CVar_RegisterChangeCallback( const idCVar &cvar, cvarChangeCallback_t callback ) {
+	idInternalCVar *internal = localCVarSystem.FindInternal( cvar.GetName() );
+	if ( !internal || !callback ) {
+		return false;
+	}
+	internal->AddChangeCallback( callback );
+	return true;
+}
 
 #define NUM_COLUMNS				77		// 78 - 1
 #define NUM_NAME_CHARS			33
