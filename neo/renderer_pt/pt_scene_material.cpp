@@ -26,6 +26,7 @@ static void PT_InitMaterial( ptMaterial_t &mat ) {
     mat.albedoTexture = -1;
     mat.normalTexture = -1;
     mat.specularTexture = -1;
+    mat.emissionTexture = -1;
     mat.blendMode = PT_BLEND_OPAQUE;
     mat.bumpScale = 1.0f;
     mat.texTransform[0] = 1.0f;
@@ -47,6 +48,7 @@ void idPathTracerScene::AddDefaultMaterial() {
     materialEmission.Append( vec3_origin );
     materialPtrs.Append( NULL );
     materialFrame.Append( -1 );
+    materialRegHash.Append( 0 );
 }
 
 /*
@@ -59,20 +61,47 @@ int idPathTracerScene::GetOrAddMaterial( const idMaterial *material, const float
         return PT_DEFAULT_MATERIAL;
     }
 
+    // Animated materials (time / entity driven registers) are evaluated per
+    // register set: entities sharing a material with different shaderParms get
+    // separate slots. Slots are recycled across frames, a slot claimed this
+    // frame is only shared by surfaces with identical registers.
+    const bool animated = !material->ConstantRegisters() && shaderRegisters;
+    const unsigned int regHash = animated
+        ? PT_HashWords( 2166136261u, shaderRegisters, material->GetNumRegisters() * sizeof( float ) ) : 0;
+
     const int key = (int)(intptr_t)material;
+    int firstSlot = -1;
+    int freeSlot = -1;
     for ( int i = materialHash.First( key ); i >= 0; i = materialHash.Next( i ) ) {
         if ( materialPtrs[i] != material ) {
             continue;
         }
-        // animated materials (time / entity driven registers) are re-evaluated once per frame
-        if ( !material->ConstantRegisters() && shaderRegisters && materialFrame[i] != frameCount ) {
-            BuildMaterial( materials[i], materialEmission[i], material, shaderRegisters );
-            materialFrame[i] = frameCount;
+        if ( !animated ) {
+            return i;
         }
-        return i;
+        if ( firstSlot < 0 ) {
+            firstSlot = i;
+        }
+        if ( materialRegHash[i] == regHash ) {
+            materialFrame[i] = frameCount;
+            return i;
+        }
+        if ( freeSlot < 0 && materialFrame[i] != frameCount ) {
+            freeSlot = i;
+        }
+    }
+
+    if ( freeSlot >= 0 ) {
+        BuildMaterial( materials[freeSlot], materialEmission[freeSlot], material, shaderRegisters );
+        materialFrame[freeSlot] = frameCount;
+        materialRegHash[freeSlot] = regHash;
+        return freeSlot;
     }
 
     if ( materials.Num() >= PT_MAX_MATERIALS ) {
+        if ( firstSlot >= 0 ) {
+            return firstSlot;	// share an instance rather than lose the material
+        }
         common->Warning( "idPathTracerScene: material limit (%d) reached, '%s' uses the default material\n",
             PT_MAX_MATERIALS, material->GetName() );
         return PT_DEFAULT_MATERIAL;
@@ -87,6 +116,7 @@ int idPathTracerScene::GetOrAddMaterial( const idMaterial *material, const float
     materialEmission.Append( emission );
     materialPtrs.Append( material );
     materialFrame.Append( frameCount );
+    materialRegHash.Append( regHash );
     materialHash.Add( key, index );
 
     if ( r_ptDebug.GetBool() ) {
@@ -296,6 +326,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
         int emTex = AddTexture(ambientGlowStage->texture.image);
         if (emTex >= 0) {
             emissionTextureIdx = emTex;
+            mat.emissionTexture = emTex;
             float emR = SAFE_REG(ambientGlowStage->color.registers[0]);
             float emG = SAFE_REG(ambientGlowStage->color.registers[1]);
             float emB = SAFE_REG(ambientGlowStage->color.registers[2]);
@@ -404,7 +435,15 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
         if (r_ptDebug.GetBool()) {
             common->Printf("  %s: specular map %d\n", material->GetName(), mat.specularTexture);
         }
-    }   
+    }
+
+    // colors are multiplied in gamma space by the GL renderer, decode every
+    // factor so that the product encoded with r_ptGamma 2.2 matches it
+    for ( int c = 0; c < 3; c++ ) {
+        mat.albedo[c] = PT_SrgbToLinear( mat.albedo[c] );
+        mat.emission[c] = PT_SrgbToLinear( mat.emission[c] );
+    }
+    emission.Set( mat.emission[0], mat.emission[1], mat.emission[2] );
 
     #undef SAFE_REG
 }

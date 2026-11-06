@@ -29,16 +29,16 @@ idCVar r_ptDebug( "r_ptDebug", "0", CVAR_RENDERER | CVAR_BOOL, "print path trace
 idCVar r_ptRenderScale( "r_ptRenderScale", "0.5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "trace resolution relative to the viewport", 0.1f, 1.0f );
 idCVar r_ptSamplesPerPixel( "r_ptSamplesPerPixel", "4", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "samples per pixel per frame", 1, 64 );
 idCVar r_ptMaxDepth( "r_ptMaxDepth", "3", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "maximum ray bounces", 1, 16 );
-idCVar r_ptMaxLightSamples( "r_ptMaxLightSamples", "2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "direct light samples per hit", 1, 8 );
-idCVar r_ptIndirectProb( "r_ptIndirectProb", "0.15", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "probability of tracing an indirect bounce", 0.0f, 1.0f );
+idCVar r_ptMaxLightSamples( "r_ptMaxLightSamples", "2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "lights sampled per hit, picked by estimated contribution", 1, 8 );
+idCVar r_ptIndirectProb( "r_ptIndirectProb", "0.15", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "probability of the one bounce GI estimate, only used when r_ptMaxDepth is 1", 0.0f, 1.0f );
 
 // path termination
 idCVar r_ptRussianRoulette( "r_ptRussianRoulette", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "Russian roulette path termination" );
 idCVar r_ptRRMinBounces( "r_ptRRMinBounces", "2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "bounces before Russian roulette starts", 0, 16 );
 idCVar r_ptRRSurvivalMin( "r_ptRRSurvivalMin", "0.1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "minimum Russian roulette survival probability", 0.01f, 0.95f );
-idCVar r_ptEarlyTermThreshold( "r_ptEarlyTermThreshold", "0.05", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "terminate paths below this throughput (biased)", 0.0f, 0.5f );
+idCVar r_ptEarlyTermThreshold( "r_ptEarlyTermThreshold", "0.05", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "Russian roulette for paths below this throughput after a bounce (unbiased)", 0.0f, 0.5f );
 idCVar r_ptFireflyClamp( "r_ptFireflyClamp", "5.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "clamp per-sample radiance (0 = off)" );
-idCVar r_ptThroughputClamp( "r_ptThroughputClamp", "0.25", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "terminate paths below this throughput (biased)", 0.0f, 1.0f );
+idCVar r_ptThroughputClamp( "r_ptThroughputClamp", "0.25", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "Russian roulette for paths below this throughput after shading (unbiased)", 0.0f, 1.0f );
 
 // accumulation
 idCVar r_ptAccumulation( "r_ptAccumulation", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "accumulate samples over frames while the view is static" );
@@ -52,7 +52,7 @@ idCVar r_ptSoftShadowScale( "r_ptSoftShadowScale", "0.2", CVAR_RENDERER | CVAR_A
 
 // display
 idCVar r_ptExposure( "r_ptExposure", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "exposure multiplier" );
-idCVar r_ptGamma( "r_ptGamma", "2.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "output gamma", 0.1f, 10.0f );
+idCVar r_ptGamma( "r_ptGamma", "2.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "output gamma, textures and colors are decoded with 2.2", 0.1f, 10.0f );
 idCVar r_ptToneMapMode( "r_ptToneMapMode", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "0 = Reinhard, 1 = ACES, 2 = Uncharted 2", 0, 2 );
 
 // sky

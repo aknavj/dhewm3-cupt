@@ -1,8 +1,6 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
-#include <thrust/execution_policy.h>
+#include <cub/device/device_radix_sort.cuh>
 
 #include "renderer_pt/cuda/pt_cuda_device.h"
 
@@ -284,6 +282,23 @@ __global__ void InitSingleLeafKernel(
 	nodes[0].bounds[5] = triangles[0].bounds[5] + EPSILON;
 }
 
+// morton3D produces 30 bit codes, the radix sort can skip the top two bits
+#define LBVH_MORTON_BITS	30
+
+/*
+================================================================================
+LBVHSortTempBytes
+================================================================================
+*/
+extern "C" size_t LBVHSortTempBytes(int numTriangles) {
+	if (numTriangles <= 1) return 0;
+	size_t bytes = 0;
+	cub::DoubleBuffer<unsigned int> keys(NULL, NULL);
+	cub::DoubleBuffer<int> vals(NULL, NULL);
+	cub::DeviceRadixSort::SortPairs(NULL, bytes, keys, vals, numTriangles, 0, LBVH_MORTON_BITS);
+	return bytes;
+}
+
 /*
 ================================================================================
 Launch Wrapper: LaunchBuildLBVH
@@ -299,7 +314,10 @@ extern "C" void LaunchBuildLBVH(
 	ptBVHNode_t* d_bvhNodes,
 	int* d_triIndices,
 	unsigned int* d_mortonCodes,
+	unsigned int* d_mortonAlt,
 	int* d_sortedIndices,
+	void* d_sortTemp,
+	size_t sortTempBytes,
 	int* d_parents,
 	int* d_atomicCounters,
 	const float* sceneBounds,
@@ -335,14 +353,16 @@ extern "C" void LaunchBuildLBVH(
 		invExt[0], invExt[1], invExt[2]
 	);
 
-	// parallel radix sort by Morton code, ordered on our stream (no device-wide sync)
-	thrust::device_ptr<unsigned int> keys(d_mortonCodes);
-	thrust::device_ptr<int> vals(d_sortedIndices);
-	thrust::sort_by_key(thrust::cuda::par.on(stream), keys, keys + numTriangles, vals);
+	// radix sort by Morton code on our stream, using the backend's persistent scratch
+	// buffer (thrust allocated and freed temporary storage on every build)
+	cub::DoubleBuffer<unsigned int> keys(d_mortonCodes, d_mortonAlt);
+	cub::DoubleBuffer<int> vals(d_sortedIndices, d_triIndices);
+	cub::DeviceRadixSort::SortPairs(d_sortTemp, sortTempBytes, keys, vals, numTriangles, 0, LBVH_MORTON_BITS, stream);
 
-	// copy sorted indices -> triIndices
-	cudaMemcpyAsync(d_triIndices, d_sortedIndices,
-		numTriangles * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+	const unsigned int* sortedCodes = keys.Current();
+	if (vals.Current() != d_triIndices) {
+		cudaMemcpyAsync(d_triIndices, vals.Current(), numTriangles * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+	}
 
 	// initialize parent array to -1
 	cudaMemsetAsync(d_parents, 0xFF, numNodes * sizeof(int), stream);
@@ -353,7 +373,7 @@ extern "C" void LaunchBuildLBVH(
 	// build radix tree topology
 	int treeGrid = (numInternalNodes + BLOCK - 1) / BLOCK;
 	BuildRadixTreeKernel<<<treeGrid, BLOCK, 0, stream>>>(
-		d_mortonCodes, numTriangles, d_bvhNodes, d_parents
+		sortedCodes, numTriangles, d_bvhNodes, d_parents
 	);
 
 	// initialize leaf nodes

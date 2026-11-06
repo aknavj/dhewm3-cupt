@@ -80,6 +80,8 @@ private:
 	ptBVHNode_t *			d_bvhNodes;		int capBVHNodes;
 	int *					d_triIndices;	int capTriIndices;
 	unsigned int *			d_mortonCodes;	int capMorton;
+	unsigned int *			d_mortonAlt;	int capMortonAlt;
+	unsigned char *			d_sortTemp;		int capSortTemp;	// CUB radix sort scratch, bytes
 	int *					d_sortedIndices;int capSorted;
 	int *					d_parents;		int capParents;
 	int *					d_atomics;		int capAtomics;
@@ -124,6 +126,8 @@ idPathTracerBackendCUDA::idPathTracerBackendCUDA() {
 	d_bvhNodes = NULL;		capBVHNodes = 0;
 	d_triIndices = NULL;	capTriIndices = 0;
 	d_mortonCodes = NULL;	capMorton = 0;
+	d_mortonAlt = NULL;		capMortonAlt = 0;
+	d_sortTemp = NULL;		capSortTemp = 0;
 	d_sortedIndices = NULL;	capSorted = 0;
 	d_parents = NULL;		capParents = 0;
 	d_atomics = NULL;		capAtomics = 0;
@@ -268,6 +272,10 @@ void idPathTracerBackendCUDA::Shutdown() {
 	cudaFree( d_bvhNodes );			d_bvhNodes = NULL;		capBVHNodes = 0;
 	cudaFree( d_triIndices );		d_triIndices = NULL;	capTriIndices = 0;
 	cudaFree( d_mortonCodes );		d_mortonCodes = NULL;	capMorton = 0;
+	cudaFree( d_mortonAlt );		d_mortonAlt = NULL;		capMortonAlt = 0;
+	cudaFree( d_sortTemp );			d_sortTemp = NULL;		capSortTemp = 0;
+	d_mortonAlt = NULL;		capMortonAlt = 0;
+	d_sortTemp = NULL;		capSortTemp = 0;
 	cudaFree( d_sortedIndices );	d_sortedIndices = NULL;	capSorted = 0;
 	cudaFree( d_parents );			d_parents = NULL;		capParents = 0;
 	cudaFree( d_atomics );			d_atomics = NULL;		capAtomics = 0;
@@ -440,7 +448,9 @@ bool idPathTracerBackendCUDA::BuildBVH( const idPathTracerScene &scene ) {
 	if ( !Reserve( d_bvhNodes, capBVHNodes, 2 * n - 1, "BVH nodes" ) ||
 		 !Reserve( d_triIndices, capTriIndices, n, "BVH indices" ) ||
 		 !Reserve( d_mortonCodes, capMorton, n, "morton codes" ) ||
+		 !Reserve( d_mortonAlt, capMortonAlt, n, "morton codes" ) ||
 		 !Reserve( d_sortedIndices, capSorted, n, "sort indices" ) ||
+		 !Reserve( d_sortTemp, capSortTemp, (int)LBVHSortTempBytes( n ), "sort scratch bytes" ) ||
 		 !Reserve( d_parents, capParents, 2 * n, "BVH parents" ) ||
 		 !Reserve( d_atomics, capAtomics, n, "BVH counters" ) ) {
 		return false;
@@ -455,8 +465,8 @@ bool idPathTracerBackendCUDA::BuildBVH( const idPathTracerScene &scene ) {
 		}
 	}
 
-	LaunchBuildLBVH( d_triangles, n, d_bvhNodes, d_triIndices, d_mortonCodes, d_sortedIndices,
-		d_parents, d_atomics, bounds, stream );
+	LaunchBuildLBVH( d_triangles, n, d_bvhNodes, d_triIndices, d_mortonCodes, d_mortonAlt, d_sortedIndices,
+		d_sortTemp, (size_t)capSortTemp, d_parents, d_atomics, bounds, stream );
 	PT_CUDA_CHECK( cudaGetLastError() );
 
 	numBVHNodes = 2 * n - 1;
@@ -602,7 +612,8 @@ void idPathTracerBackendCUDA::GetStats( ptBackendStats_t &stats ) const {
 		+ (size_t)capTriangles * sizeof( ptTriangle_t )
 		+ (size_t)capBVHNodes * sizeof( ptBVHNode_t )
 		+ (size_t)( capTriIndices + capSorted + capParents + capAtomics ) * sizeof( int )
-		+ (size_t)capMorton * sizeof( unsigned int )
+		+ (size_t)( capMorton + capMortonAlt ) * sizeof( unsigned int )
+		+ (size_t)capSortTemp
 		+ (size_t)capMaterials * sizeof( ptMaterial_t )
 		+ (size_t)capLights * sizeof( ptLight_t )
 		+ PT_MAX_TEXTURES * sizeof( cudaTexture_t );

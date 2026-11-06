@@ -10,6 +10,21 @@ class idImage;
 struct drawSurf_s;
 struct viewLight_s;
 
+// FNV-1a over 32 bit words
+static ID_INLINE unsigned int PT_HashWords( unsigned int h, const void *data, size_t bytes ) {
+	const unsigned int *w = (const unsigned int *)data;
+	const size_t n = bytes / sizeof( unsigned int );
+	for ( size_t i = 0; i < n; i++ ) {
+		h = ( h ^ w[i] ) * 16777619u;
+	}
+	return h;
+}
+
+// decodes a gamma space color factor to linear, the inverse of the default r_ptGamma
+static ID_INLINE float PT_SrgbToLinear( float c ) {
+	return c > 0.0f ? powf( c, 2.2f ) : 0.0f;
+}
+
 typedef struct {
 	int				index;			// slot in idPathTracerScene::Textures()
 	int				width;
@@ -27,7 +42,9 @@ typedef struct {
 
 	Geometry and lights are rebuilt every view. Materials and textures are cached
 	across views (keyed by engine pointer) until the texture budget overflows or
-	Clear() is called. Newly referenced textures are read back from OpenGL and
+	Clear() is called. Materials with entity or time driven registers get one
+	slot per distinct register set used in a frame, so entities sharing such a
+	material keep their own colors. Newly referenced textures are read back from OpenGL and
 	queued as pending uploads for the backend.
 
 ===============================================================================
@@ -76,20 +93,25 @@ private:
 	void					FlushMaterialsAndTextures();
 	void					AddDefaultMaterial();
 
+	// triFlags: PT_TRI_WEAPON / PT_TRI_NO_OCCLUDE from the entity, material derived flags are added
 	void					AddTriangles( const idDrawVert *verts, int numVerts, const int *indexes, int numIndexes,
-										  int materialIndex, const float *modelMatrix );
-	void					AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2, int materialIndex );
+										  int materialIndex, const float *modelMatrix, int triFlags );
+	bool					AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2, int materialIndex );
+	// a non-NULL lightProject selects the GL style box falloff (light image * falloff image)
 	void					AddLight( const idVec3 &position, const idVec3 &color, float intensity, int type,
-									  float lightRadius, const float *lightProject, int projTexIndex, const float *lightRadiusXYZ );
+									  float lightRadius, const float *lightProject, int projTexIndex, int falloffTexIndex,
+									  const float *lightRadiusXYZ );
 	void					AddSpotLight( const idVec3 &position, const idVec3 &direction, const idVec3 &color,
 										  float intensity, float coneAngle, float coneFalloff, float lightRadius,
-										  const float *lightProject, int projTexIndex, const float *rightAxis, const float *upAxis );
+										  const float *lightProject, int projTexIndex, int falloffTexIndex,
+										  const float *rightAxis, const float *upAxis );
 
 	// per view
 	idList<ptVertex_t>		vertices;
 	idList<ptTriangle_t>	triangles;
 	idList<ptLight_t>		lights;
 	idList<ptLight_t>		areaLights;			// emissive triangles, appended after real lights in EndFrame
+	idList<int>				areaLightTris;		// triangle of each areaLights entry
 	float					bounds[6];
 	unsigned int			contentHash;
 	unsigned int			structureHash;
@@ -100,6 +122,7 @@ private:
 	idList<idVec3>			materialEmission;
 	idList<const idMaterial *> materialPtrs;
 	idList<int>				materialFrame;		// frame the material was last evaluated
+	idList<unsigned int>	materialRegHash;	// shader registers the slot was built with (animated materials)
 	idHashIndex				materialHash;
 
 	idList<ptTextureInfo_t>	textures;

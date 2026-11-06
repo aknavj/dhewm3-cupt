@@ -1,7 +1,6 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <device_launch_parameters.h>
-#include <curand_kernel.h>
 
 #include "renderer_pt/cuda/pt_cuda_device.h"
 #include "renderer_pt/cuda/pt_kernel_triangles.cuh"

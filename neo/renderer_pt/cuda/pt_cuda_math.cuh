@@ -59,35 +59,53 @@ __device__ inline float length3(const float* v) {
 
 /*
 ========================
-hashRNG - PCG-style hash mixing for RNG
+PCG random numbers
+
+pcg_hash (Jarzynski & Olano, "Hash Functions for GPU Rendering") seeds one
+32 bit LCG state per pixel and frame; every draw advances the LCG and runs
+the PCG RXS-M-XS output permutation. 4 bytes of state instead of curand's
+48 byte XORWOW state and no expensive curand_init.
 ========================
 */
-__device__ inline unsigned int hashRNG(unsigned int seed) {
-	seed = (seed ^ 61u) ^ (seed >> 16u);
-	seed *= 9u;
-	seed = seed ^ (seed >> 4u);
-	seed *= 0x27d4eb2du;
-	seed = seed ^ (seed >> 15u);
-	return seed;
+struct ptRng_t {
+	unsigned int state;
+};
+
+__device__ __forceinline__ unsigned int PT_PcgPermute(unsigned int state) {
+	unsigned int word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+	return (word >> 22u) ^ word;
+}
+
+__device__ __forceinline__ unsigned int PT_PcgHash(unsigned int v) {
+	return PT_PcgPermute(v * 747796405u + 2891336453u);
+}
+
+__device__ __forceinline__ void PT_RngInit(ptRng_t* rng, unsigned int pixel, unsigned int frame) {
+	rng->state = PT_PcgHash(pixel ^ PT_PcgHash(frame + 0x9E3779B9u));
+}
+
+// uniform float in [0, 1)
+__device__ __forceinline__ float PT_Rand(ptRng_t* rng) {
+	rng->state = rng->state * 747796405u + 2891336453u;
+	return (float)(PT_PcgPermute(rng->state) >> 8) * (1.0f / 16777216.0f);
+}
+
+// stateless hash, used for per-triangle debug colors
+__device__ __forceinline__ unsigned int cupt_hash(unsigned int seed) {
+	return PT_PcgHash(seed);
 }
 
 /*
 ========================
-hashRandFloat - Advance RNG state and return a float in [0, 1)
+PT_SrgbToLinear
+
+Plain 2.2 power curve: it is the exact inverse of the default r_ptGamma, so
+an unlit texture (GUIs, ambient-only overlays) round-trips unchanged and lit
+surfaces reproduce the GL renderer's gamma-space modulation.
 ========================
 */
-__device__ inline float hashRandFloat(unsigned int& state) {
-	state = hashRNG(state);
-	return (float)(state & 0x00FFFFFF) / (float)0x01000000;
-}
-
-// legacy aliases for backward compatibility with old kernels
-__device__ __forceinline__ unsigned int cupt_hash(unsigned int seed) {
-	return hashRNG(seed);
-}
-
-__device__ __forceinline__ float cupt_random(unsigned int seed) {
-	return float(hashRNG(seed)) / float(0xFFFFFFFFu);
+__device__ __forceinline__ float PT_SrgbToLinear(float c) {
+	return c > 0.0f ? exp2f(2.2f * log2f(c)) : 0.0f;
 }
 
 #endif // HAVE_CUDA

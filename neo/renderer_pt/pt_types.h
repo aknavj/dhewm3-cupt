@@ -31,6 +31,14 @@ enum ptLightType_t {
 	PT_LIGHT_AREA			= 2		// generated from emissive triangles
 };
 
+// ptTriangle_t::flags, derived from the material and the entity on the host
+enum ptTriangleFlags_t {
+	PT_TRI_WEAPON			= 1,	// view weapon (weaponDepthHack): seen by camera rays only, never occludes
+	PT_TRI_NO_OCCLUDE		= 2,	// never blocks shadow rays (noShadows, additive, unlit overlays)
+	PT_TRI_OPAQUE			= 4,	// always blocks shadow rays, no material lookup needed
+	PT_TRI_AREA_LIGHT		= 8		// also a PT_LIGHT_AREA, bounce hits skip its emission where it was sampled
+};
+
 enum ptBlendMode_t {
 	PT_BLEND_OPAQUE			= 0,
 	PT_BLEND_ALPHA			= 1,
@@ -69,6 +77,7 @@ typedef struct {
 	int vertexIndices[3];
 	float bounds[6];			// min xyz, max xyz
 	int materialIndex;
+	int flags;					// ptTriangleFlags_t
 } ptTriangle_t;
 
 typedef struct {
@@ -76,9 +85,14 @@ typedef struct {
 	int height;					// 0x0 means "not resident", samplers return white
 } ptTextureInfo_t;
 
+/*
+Colors (albedo, emission, light colors) are linear. Textures are stored as read
+back from GL; albedo, emission and light textures are sRGB encoded and decoded
+by the samplers, normal and specular maps are used as is.
+*/
 typedef struct {
 	float albedo[4];			// base color + alpha
-	float emission[3];			// emissive color (glowing materials)
+	float emission[3];			// emissive color (glowing materials), modulated by emissionTexture
 	float metallic;
 	float roughness;
 	float ior;					// index of refraction
@@ -91,6 +105,7 @@ typedef struct {
 	int albedoTexture;			// texture index or -1
 	int normalTexture;
 	int specularTexture;
+	int emissionTexture;		// glow stage texture or -1
 	float bumpScale;
 	float texTransform[6];		// scale.x, scale.y, rotate, translate.x, translate.y, scroll_speed
 	float polygonOffset;		// depth bias for decals
@@ -110,7 +125,10 @@ typedef struct {
 	float coneFalloff;			// spot edge exponent
 
 	float lightProject[4][4];	// Doom 3 light projection planes (world space)
-	int projectedTextureIndex;
+	int projectedTextureIndex;	// light image, sampled at the projected (s, t)
+	int falloffTextureIndex;	// falloff image, sampled at (falloff, 0.5)
+	int boxFalloff;				// attenuate by lightProject / light image / falloff image
+								// like the GL renderer instead of the spherical window
 
 	float lightRadius3[3];		// xyz extents for area sampling
 
@@ -160,8 +178,8 @@ typedef struct {
 	int rrEnabled;
 	int rrMinBounces;
 	float rrSurvivalMin;
-	float earlyTermThreshold;
-	float throughputClamp;
+	float earlyTermThreshold;	// Russian roulette below this throughput (unbiased)
+	float throughputClamp;		// Russian roulette below this throughput after shading (unbiased)
 	float fireflyClamp;
 
 	// shading

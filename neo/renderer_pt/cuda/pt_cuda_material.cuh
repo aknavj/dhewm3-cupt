@@ -49,6 +49,14 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 	}
 }
 
+// SampleTexture with the color channels decoded from sRGB (albedo, glow and light images)
+__device__ inline void SampleTextureSrgb(const cudaTexture_t* textures, int texIndex, float u, float v, float* color) {
+	SampleTexture(textures, texIndex, u, v, color);
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
+}
+
 /*
 =================================================================================
 PBR Material Evaluation - Cook-Torrance BRDF

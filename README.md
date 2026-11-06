@@ -50,11 +50,15 @@ and all GUI drawing on top of the 3D view.
 ## Key Features
 
 - **Linear BVH (LBVH)** built entirely on the GPU every frame using the Karras algorithm
-  and a radix sort, ordered on a single CUDA stream with no device-wide syncs
+  and a CUB radix sort, ordered on a single CUDA stream with no device-wide syncs
 - **PBR materials** extracted from Doom 3 shader stages: albedo, normal map, specular,
   alpha test, blend modes, vertex colours, emission, glass (Fresnel + IOR). Time-varying shader
-  registers are re-evaluated every frame
-- **Stochastic direct lighting** with soft shadows, projected light textures and spotlight falloff
+  registers are re-evaluated every frame, per entity
+- **Stochastic direct lighting** with soft shadows, matching the GL light model: projected light
+  image times falloff image, stage colours and condition registers, lights picked by estimated
+  contribution. Shadow rays pass through alpha tested and translucent surfaces
+- **sRGB correct shading**: textures and colours are decoded to linear before lighting
+- **First person weapon** rendered as an overlay that never gets clipped by nearby walls
 - **Indirect lighting** via cosine-weighted hemisphere sampling, plus emissive surfaces as area lights
 - **Volumetric scattering** with a ray-marched Henyey-Greenstein phase function
 - **Progressive accumulation** that resets on camera, mode, resolution or (configurable) scene
@@ -104,13 +108,13 @@ Without `CUDA_PATHTRACER` the engine builds and runs as plain dhewm3, with no pa
 | `r_ptRenderScale` | `0.5` | Trace resolution relative to the viewport (0.1–1.0) |
 | `r_ptSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
 | `r_ptMaxDepth` | `3` | Maximum ray bounces (1–16) |
-| `r_ptMaxLightSamples` | `2` | Direct light samples per hit (1–8) |
-| `r_ptIndirectProb` | `0.15` | Probability of tracing an indirect bounce (0–1) |
+| `r_ptMaxLightSamples` | `2` | Lights sampled per hit, picked by estimated contribution (1–8) |
+| `r_ptIndirectProb` | `0.15` | Probability of the one bounce GI estimate, only used when `r_ptMaxDepth` is 1 (0–1) |
 | `r_ptRussianRoulette` | `1` | Russian roulette path termination |
 | `r_ptRRMinBounces` | `2` | Bounces before Russian roulette starts (0–16) |
 | `r_ptRRSurvivalMin` | `0.1` | Minimum survival probability (0.01–0.95) |
-| `r_ptEarlyTermThreshold` | `0.05` | Terminate paths below this throughput (0–0.5, biased) |
-| `r_ptThroughputClamp` | `0.25` | Terminate paths below this throughput (0–1, biased) |
+| `r_ptEarlyTermThreshold` | `0.05` | Russian roulette for paths below this throughput after a bounce (0–0.5, unbiased) |
+| `r_ptThroughputClamp` | `0.25` | Russian roulette for paths below this throughput after shading (0–1, unbiased) |
 | `r_ptFireflyClamp` | `5.0` | Clamp per-sample radiance (0 = off) |
 | `r_ptAccumulation` | `1` | Accumulate samples while the view is static |
 | `r_ptResetOnSceneChange` | `1` | Restart accumulation on scene changes: 0 = camera only, 1 = objects/lights appearing or vanishing, 2 = any change incl. animation (may never converge) |
@@ -119,7 +123,7 @@ Without `CUDA_PATHTRACER` the engine builds and runs as plain dhewm3, with no pa
 | `r_ptSpecularBoost` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
 | `r_ptSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard shadows) |
 | `r_ptExposure` | `1.0` | Exposure multiplier |
-| `r_ptGamma` | `2.2` | Output gamma |
+| `r_ptGamma` | `2.2` | Output gamma, textures and colors are decoded with 2.2 |
 | `r_ptToneMapMode` | `1` | 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |
 | `r_ptSkyIntensity` | `0.0` | Sky dome intensity for primary ray misses |
 | `r_ptSkyColorZenithR/G/B` | `0.3 / 0.35 / 0.5` | Sky zenith colour |

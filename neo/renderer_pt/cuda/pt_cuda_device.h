@@ -27,11 +27,20 @@ struct cudaTexture_t {
 	unsigned char *data;		// RGBA8, NULL when not resident
 };
 
+// ptRay_t::flags
+#define PT_RAY_SEES_WEAPON		1		// camera ray segment, PT_TRI_WEAPON triangles are visible and win
+
+// view weapons poke into walls and floors, the GL renderer hides that with a depth hack
+#define PT_WEAPON_REACH			64.0f	// camera rays look this far for a weapon hit
+#define PT_WEAPON_CLEARANCE		32.0f	// rays leaving the weapon ignore world geometry this close
+
 struct ptRay_t {
 	float origin[3];
 	float direction[3];
 	float tMin;
 	float tMax;
+	float worldTMin;			// non-weapon triangles closer than this are ignored
+	int flags;
 };
 
 struct ptHitInfo_t {
@@ -45,6 +54,7 @@ struct ptHitInfo_t {
 	float barycentrics[3];		// (w, u, v)
 	int materialIndex;
 	int triangleIndex;
+	int triFlags;				// ptTriangle_t::flags of the hit triangle
 };
 
 #ifdef __CUDACC__
@@ -107,10 +117,15 @@ void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer
 void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,
 							  float exposure, float gamma, int toneMapMode, int frameCount, cudaStream_t stream );
 
-// GPU LBVH construction, sceneBounds is a host pointer (min xyz, max xyz)
+// scratch bytes LaunchBuildLBVH needs in d_sortTemp for numTriangles triangles
+size_t LBVHSortTempBytes( int numTriangles );
+
+// GPU LBVH construction, sceneBounds is a host pointer (min xyz, max xyz).
+// d_mortonCodes / d_mortonAlt and d_sortedIndices are numTriangles long sort buffers.
 void LaunchBuildLBVH( const ptTriangle_t *d_triangles, int numTriangles, ptBVHNode_t *d_bvhNodes, int *d_triIndices,
-					  unsigned int *d_mortonCodes, int *d_sortedIndices, int *d_parents, int *d_atomicCounters,
-					  const float *sceneBounds, cudaStream_t stream );
+					  unsigned int *d_mortonCodes, unsigned int *d_mortonAlt, int *d_sortedIndices,
+					  void *d_sortTemp, size_t sortTempBytes,
+					  int *d_parents, int *d_atomicCounters, const float *sceneBounds, cudaStream_t stream );
 
 #ifdef __cplusplus
 }
