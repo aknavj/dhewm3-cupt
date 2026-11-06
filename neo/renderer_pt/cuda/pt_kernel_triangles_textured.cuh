@@ -114,16 +114,12 @@ __global__ void TriangleDrawTexturedKernel(
 	float hitU = 0.0f;
 	float hitV = 0.0f;
 
-	int stack[64];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
-
-	while (stackPtr > 0) {
-		int nodeIdx = stack[--stackPtr];
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
 		const ptBVHNode_t& node = bvhNodes[nodeIdx];
 
 		if (!IntersectAABB_Simple(origX, origY, origZ, invDirX, invDirY, invDirZ,
 								  node.bounds, nearestT)) {
+			nodeIdx = node.escapeIndex;
 			continue;
 		}
 
@@ -143,13 +139,9 @@ __global__ void TriangleDrawTexturedKernel(
 					hitV = bv;
 				}
 			}
+			nodeIdx = node.escapeIndex;
 		} else {
-			if (node.leftChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.leftChild;
-			}
-			if (node.rightChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.rightChild;
-			}
+			nodeIdx = node.leftChild;
 		}
 	}
 

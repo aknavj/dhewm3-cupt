@@ -30,7 +30,7 @@ static void PT_InitMaterial( ptMaterial_t &mat ) {
     mat.blendMode = PT_BLEND_OPAQUE;
     mat.bumpScale = 1.0f;
     mat.texTransform[0] = 1.0f;
-    mat.texTransform[1] = 1.0f;
+    mat.texTransform[4] = 1.0f;
 }
 
 /*
@@ -47,6 +47,7 @@ void idPathTracerScene::AddDefaultMaterial() {
     materials.Append( mat );
     materialEmission.Append( vec3_origin );
     materialPtrs.Append( NULL );
+    materialNameHashes.Append( 0 );
     materialFrame.Append( -1 );
     materialRegHash.Append( 0 );
 }
@@ -70,10 +71,11 @@ int idPathTracerScene::GetOrAddMaterial( const idMaterial *material, const float
         ? PT_HashWords( 2166136261u, shaderRegisters, material->GetNumRegisters() * sizeof( float ) ) : 0;
 
     const int key = (int)(intptr_t)material;
+    const unsigned int nameHash = PT_HashString( material->GetName() );
     int firstSlot = -1;
     int freeSlot = -1;
     for ( int i = materialHash.First( key ); i >= 0; i = materialHash.Next( i ) ) {
-        if ( materialPtrs[i] != material ) {
+        if ( materialPtrs[i] != material || materialNameHashes[i] != nameHash ) {
             continue;
         }
         if ( !animated ) {
@@ -115,6 +117,7 @@ int idPathTracerScene::GetOrAddMaterial( const idMaterial *material, const float
     materials.Append( mat );
     materialEmission.Append( emission );
     materialPtrs.Append( material );
+    materialNameHashes.Append( nameHash );
     materialFrame.Append( frameCount );
     materialRegHash.Append( regHash );
     materialHash.Add( key, index );
@@ -196,6 +199,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
     const shaderStage_t *diffuseStage = NULL;
     const shaderStage_t *normalStage = NULL;
     const shaderStage_t *specularStage = NULL;
+    const shaderStage_t *albedoTextureStage = NULL;
 
     for (int i = 0; i < material->GetNumStages(); i++) {
         const shaderStage_t* stage = material->GetStage(i);
@@ -296,6 +300,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
     }
 
     if (hasDiffuse) {
+        albedoTextureStage = diffuseStage;
         mat.albedoTexture = AddTexture(diffuseStage->texture.image);
         if (mat.albedoTexture >= 0) {
             mat.albedo[0] = SAFE_REG(diffuseStage->color.registers[0]);
@@ -344,6 +349,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
         if (!albedoSource) albedoSource = ambientGlowStage;
 
         if (albedoSource && albedoSource->texture.image) {
+            albedoTextureStage = albedoSource;
             int ambTex = AddTexture(albedoSource->texture.image);
             if (ambTex >= 0) {
                 mat.albedoTexture = ambTex;
@@ -406,6 +412,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
 
             // for blended surfaces, use the blend stage texture as albedo if we don't have one
             if (mat.blendMode > 0 && blendStage->texture.image && mat.albedoTexture < 0) {
+                albedoTextureStage = blendStage;
                 mat.albedoTexture = AddTexture(blendStage->texture.image);
                 mat.albedo[0] = SAFE_REG(blendStage->color.registers[0]);
                 mat.albedo[1] = SAFE_REG(blendStage->color.registers[1]);
@@ -435,6 +442,16 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
         if (r_ptDebug.GetBool()) {
             common->Printf("  %s: specular map %d\n", material->GetName(), mat.specularTexture);
         }
+    }
+
+    if (albedoTextureStage && albedoTextureStage->texture.hasMatrix && regs) {
+        const int (*matrix)[3] = albedoTextureStage->texture.matrix;
+        mat.texTransform[0] = SAFE_REG(matrix[0][0]);
+        mat.texTransform[1] = SAFE_REG(matrix[0][1]);
+        mat.texTransform[2] = SAFE_REG(matrix[0][2]);
+        mat.texTransform[3] = SAFE_REG(matrix[1][0]);
+        mat.texTransform[4] = SAFE_REG(matrix[1][1]);
+        mat.texTransform[5] = SAFE_REG(matrix[1][2]);
     }
 
     // colors are multiplied in gamma space by the GL renderer, decode every

@@ -20,6 +20,14 @@ static ID_INLINE unsigned int PT_HashWords( unsigned int h, const void *data, si
 	return h;
 }
 
+static ID_INLINE unsigned int PT_HashString( const char *s ) {
+	unsigned int h = 2166136261u;
+	for ( ; s && *s; s++ ) {
+		h = ( h ^ (unsigned char)*s ) * 16777619u;
+	}
+	return h;
+}
+
 // decodes a gamma space color factor to linear, the inverse of the default r_ptGamma
 static ID_INLINE float PT_SrgbToLinear( float c ) {
 	return c > 0.0f ? powf( c, 2.2f ) : 0.0f;
@@ -121,12 +129,15 @@ private:
 	idList<ptMaterial_t>	materials;
 	idList<idVec3>			materialEmission;
 	idList<const idMaterial *> materialPtrs;
+	idList<unsigned int>		materialNameHashes;
 	idList<int>				materialFrame;		// frame the material was last evaluated
 	idList<unsigned int>	materialRegHash;	// shader registers the slot was built with (animated materials)
 	idHashIndex				materialHash;
 
 	idList<ptTextureInfo_t>	textures;
 	idList<const idImage *>	texturePtrs;
+	idList<unsigned int>		textureNameHashes;
+	idList<int>				textureGLNames;
 	idHashIndex				textureHash;
 	idList<ptTextureUpload_t> pendingTextures;
 	int						textureGeneration;

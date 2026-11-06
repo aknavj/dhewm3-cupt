@@ -571,7 +571,7 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	accumFrames++;
 	LaunchToneMappingKernel( d_accum, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode,
-		accumulate ? accumFrames : 1, stream );
+		stream );
 	PT_CUDA_CHECK( cudaGetLastError() );
 
 	cudaEventRecord( timerStop, stream );

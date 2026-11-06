@@ -67,9 +67,9 @@ LaunchToneMappingKernel
 ========================
 */
 extern "C" void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,
-										 float exposure, float gamma, int toneMapMode, int frameCount, cudaStream_t stream ) {
+										 float exposure, float gamma, int toneMapMode, cudaStream_t stream ) {
 	const dim3 blockSize( TILE_SIZE, TILE_SIZE );
 	const dim3 gridSize( ( width + TILE_SIZE - 1 ) / TILE_SIZE, ( height + TILE_SIZE - 1 ) / TILE_SIZE );
 
-	ToneMappingKernel<<<gridSize, blockSize, 0, stream>>>( hdrBuffer, ldrBuffer, width, height, exposure, gamma, toneMapMode, frameCount );
+	ToneMappingKernel<<<gridSize, blockSize, 0, stream>>>( hdrBuffer, ldrBuffer, width, height, exposure, gamma, toneMapMode );
 }

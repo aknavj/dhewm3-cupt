@@ -62,7 +62,10 @@ and all GUI drawing on top of the 3D view.
 - **Indirect lighting** via cosine-weighted hemisphere sampling, plus emissive surfaces as area lights
 - **Volumetric scattering** with a ray-marched Henyey-Greenstein phase function
 - **Progressive accumulation** that resets on camera, mode, resolution or (configurable) scene
-  changes, with a quality ramp-up over the first frames
+  changes, uses a running mean to preserve precision, and ramps quality over the first frames
+- **Stackless BVH traversal** with escape links, so deep LBVH trees cannot overflow a per-ray stack
+- **Cache invalidation** after `reloadImages`, plus identity checks to avoid stale cache hits when
+  engine pointers are reused
 - **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
 - **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
 

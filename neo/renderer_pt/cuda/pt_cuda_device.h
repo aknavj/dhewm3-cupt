@@ -115,7 +115,7 @@ void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer
 
 // resolves the accumulation buffer into RGBA8
 void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,
-							  float exposure, float gamma, int toneMapMode, int frameCount, cudaStream_t stream );
+							  float exposure, float gamma, int toneMapMode, cudaStream_t stream );
 
 // scratch bytes LaunchBuildLBVH needs in d_sortTemp for numTriangles triangles
 size_t LBVHSortTempBytes( int numTriangles );

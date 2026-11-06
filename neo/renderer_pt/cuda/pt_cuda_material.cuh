@@ -24,12 +24,13 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 	u = u - floorf(u);
 	v = v - floorf(v);
 
-	// convert to texel coordinates
-	float x = u * (float)tex.width;
-	float y = v * (float)tex.height;
-
-	int x0 = (int)x % tex.width;
-	int y0 = (int)y % tex.height;
+	// Normalized GL sampling places texel centers at (i + 0.5) / size.
+	float x = u * (float)tex.width - 0.5f;
+	float y = v * (float)tex.height - 0.5f;
+	const int ix = (int)floorf(x);
+	const int iy = (int)floorf(y);
+	int x0 = (ix % tex.width + tex.width) % tex.width;
+	int y0 = (iy % tex.height + tex.height) % tex.height;
 	int x1 = (x0 + 1) % tex.width;
 	int y1 = (y0 + 1) % tex.height;
 

@@ -113,6 +113,16 @@ typedef struct {
 
 static ptFrontEnd_t pt;
 
+void RB_PT_InvalidateImages( void ) {
+	if ( pt.backend ) {
+		pt.backend->ResetAccumulation();
+	}
+	if ( pt.scene ) {
+		pt.scene->Clear();
+	}
+	pt.havePrev = false;
+}
+
 /*
 ========================
 PT_FindFactory

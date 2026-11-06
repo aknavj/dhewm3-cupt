@@ -202,6 +202,24 @@ __global__ void InitLeafNodesKernel(
 	nodes[nodeIdx].bounds[5] = tri.bounds[5] + EPSILON;
 }
 
+__global__ void BuildEscapeLinksKernel(ptBVHNode_t* nodes, const int* parents, int numNodes) {
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= numNodes) return;
+
+	int child = idx;
+	int parent = parents[child];
+	int escape = -1;
+	while (parent >= 0) {
+		if (nodes[parent].leftChild == child) {
+			escape = nodes[parent].rightChild;
+			break;
+		}
+		child = parent;
+		parent = parents[child];
+	}
+	nodes[idx].escapeIndex = escape;
+}
+
 /*
 ================================================================================
 Kernel 4: Bottom-Up AABB Propagation
@@ -272,6 +290,7 @@ __global__ void InitSingleLeafKernel(
 	nodes[0].rightChild = -1;
 	nodes[0].firstPrimitive = 0;
 	nodes[0].primitiveCount = 1;
+	nodes[0].escapeIndex = -1;
 
 	const float EPSILON = 0.001f;
 	nodes[0].bounds[0] = triangles[0].bounds[0] - EPSILON;
@@ -380,6 +399,9 @@ extern "C" void LaunchBuildLBVH(
 	InitLeafNodesKernel<<<grid, BLOCK, 0, stream>>>(
 		d_triangles, d_triIndices, d_bvhNodes, numTriangles
 	);
+
+	const int nodeGrid = (numNodes + BLOCK - 1) / BLOCK;
+	BuildEscapeLinksKernel<<<nodeGrid, BLOCK, 0, stream>>>(d_bvhNodes, d_parents, numNodes);
 
 	// bottom-up AABB propagation
 	ComputeNodeBoundsKernel<<<grid, BLOCK, 0, stream>>>(

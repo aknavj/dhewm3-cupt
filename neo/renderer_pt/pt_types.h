@@ -107,7 +107,7 @@ typedef struct {
 	int specularTexture;
 	int emissionTexture;		// glow stage texture or -1
 	float bumpScale;
-	float texTransform[6];		// scale.x, scale.y, rotate, translate.x, translate.y, scroll_speed
+	float texTransform[6];		// affine transform: u'=x0*u+x1*v+x2, v'=x3*u+x4*v+x5
 	float polygonOffset;		// depth bias for decals
 } ptMaterial_t;
 
@@ -142,6 +142,7 @@ typedef struct {
 	int rightChild;
 	int firstPrimitive;			// leaves only
 	int primitiveCount;
+	int escapeIndex;			// next node after this subtree, for stackless traversal
 } ptBVHNode_t;
 
 /*

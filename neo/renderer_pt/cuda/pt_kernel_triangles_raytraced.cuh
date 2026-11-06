@@ -27,15 +27,11 @@ __device__ __forceinline__ bool TraceShadowRay_RT(
 	float idY = 1.0f / (fabsf(dY) > 1e-8f ? dY : copysignf(1e-8f, dY));
 	float idZ = 1.0f / (fabsf(dZ) > 1e-8f ? dZ : copysignf(1e-8f, dZ));
 
-	int stack[64];
-	int sp = 0;
-	stack[sp++] = 0;
-
-	while (sp > 0) {
-		int ni = stack[--sp];
+	for (int ni = 0; ni >= 0; ) {
 		const ptBVHNode_t& nd = bvhNodes[ni];
 
 		if (!IntersectAABB_Simple(oX, oY, oZ, idX, idY, idZ, nd.bounds, maxDist)) {
+			ni = nd.escapeIndex;
 			continue;
 		}
 
@@ -49,9 +45,9 @@ __device__ __forceinline__ bool TraceShadowRay_RT(
 					return true;
 				}
 			}
+			ni = nd.escapeIndex;
 		} else {
-			if (nd.leftChild >= 0 && sp < 63) stack[sp++] = nd.leftChild;
-			if (nd.rightChild >= 0 && sp < 63) stack[sp++] = nd.rightChild;
+			ni = nd.leftChild;
 		}
 	}
 	return false;
@@ -81,15 +77,11 @@ __device__ __forceinline__ float TraceRay_RT(
 	float nearest = 1e30f;
 	outTriIdx = -1;
 
-	int stack[64];
-	int sp = 0;
-	stack[sp++] = 0;
-
-	while (sp > 0) {
-		int ni = stack[--sp];
+	for (int ni = 0; ni >= 0; ) {
 		const ptBVHNode_t& nd = bvhNodes[ni];
 
 		if (!IntersectAABB_Simple(oX, oY, oZ, idX, idY, idZ, nd.bounds, nearest)) {
+			ni = nd.escapeIndex;
 			continue;
 		}
 
@@ -107,9 +99,9 @@ __device__ __forceinline__ float TraceRay_RT(
 					outV = bv;
 				}
 			}
+			ni = nd.escapeIndex;
 		} else {
-			if (nd.leftChild >= 0 && sp < 63) stack[sp++] = nd.leftChild;
-			if (nd.rightChild >= 0 && sp < 63) stack[sp++] = nd.rightChild;
+			ni = nd.leftChild;
 		}
 	}
 	return nearest;

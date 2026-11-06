@@ -105,11 +105,14 @@ void idPathTracerScene::FlushMaterialsAndTextures() {
 
 	textures.Clear();
 	texturePtrs.Clear();
+	textureNameHashes.Clear();
+	textureGLNames.Clear();
 	textureHash.Free();
 
 	materials.Clear();
 	materialEmission.Clear();
 	materialPtrs.Clear();
+	materialNameHashes.Clear();
 	materialFrame.Clear();
 	materialRegHash.Clear();
 	materialHash.Free();
@@ -614,7 +617,9 @@ int idPathTracerScene::AddTexture( const idImage *image ) {
 
 	const int key = (int)(intptr_t)image;
 	for ( int i = textureHash.First( key ); i >= 0; i = textureHash.Next( i ) ) {
-		if ( texturePtrs[i] == image ) {
+		if ( texturePtrs[i] == image
+				&& textureNameHashes[i] == PT_HashString( image->imgName.c_str() )
+				&& textureGLNames[i] == image->texnum ) {
 			return i;
 		}
 	}
@@ -671,6 +676,8 @@ int idPathTracerScene::AddTexture( const idImage *image ) {
 
 	const int index = textures.Append( info );
 	texturePtrs.Append( image );
+	textureNameHashes.Append( PT_HashString( image->imgName.c_str() ) );
+	textureGLNames.Append( image->texnum );
 	textureHash.Add( key, index );
 
 	upload.index = index;

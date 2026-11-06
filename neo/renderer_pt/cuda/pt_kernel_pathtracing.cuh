@@ -8,8 +8,6 @@
 #include "renderer_pt/cuda/pt_cuda_math.cuh"
 #include "renderer_pt/cuda/pt_cuda_material.cuh"
 
-#define PT_BVH_STACK	128	// LBVH trees are not depth bounded
-
 /*
 =================================================================================
 IntersectTriangleUV
@@ -120,28 +118,6 @@ __device__ __forceinline__ bool PT_RayBox(const float* orig, const float* invD, 
 	return tmin <= tmax;
 }
 
-// pushes the children of an inner node, the one closer along the ray on top
-__device__ __forceinline__ void PT_PushChildren(const ptBVHNode_t& node, const ptBVHNode_t* nodes, const float* orig,
-												const float* dir, int* stack, int& stackPtr) {
-	if (stackPtr > PT_BVH_STACK - 2) {
-		return;
-	}
-	const float* lb = nodes[node.leftChild].bounds;
-	const float* rb = nodes[node.rightChild].bounds;
-	float leftDot = 0.0f, rightDot = 0.0f;
-	for (int i = 0; i < 3; i++) {
-		leftDot += ((lb[i] + lb[i + 3]) - 2.0f * orig[i]) * dir[i];
-		rightDot += ((rb[i] + rb[i + 3]) - 2.0f * orig[i]) * dir[i];
-	}
-	if (leftDot < rightDot) {
-		stack[stackPtr++] = node.rightChild;
-		stack[stackPtr++] = node.leftChild;
-	} else {
-		stack[stackPtr++] = node.leftChild;
-		stack[stackPtr++] = node.rightChild;
-	}
-}
-
 /*
 =================================================================================
 IntersectBVH - closest hit
@@ -174,20 +150,17 @@ __device__ bool IntersectBVH(
 	int bestTri = -1;
 	bool bestWeapon = false;
 
-	int stack[PT_BVH_STACK];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
-
-	while (stackPtr > 0) {
-		const ptBVHNode_t& node = nodes[stack[--stackPtr]];
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = nodes[nodeIdx];
 
 		const float cullT = (seesWeapon && !bestWeapon) ? fmaxf(bestT, weaponMax) : bestT;
 		if (!PT_RayBox(ray.origin, invD, node.bounds, ray.tMin, cullT)) {
+			nodeIdx = node.escapeIndex;
 			continue;
 		}
 
 		if (node.leftChild != -1) {
-			PT_PushChildren(node, nodes, ray.origin, ray.direction, stack, stackPtr);
+			nodeIdx = node.leftChild;
 			continue;
 		}
 
@@ -215,6 +188,7 @@ __device__ bool IntersectBVH(
 			bestV = v;
 			bestTri = triIdx;
 		}
+		nodeIdx = node.escapeIndex;
 	}
 
 	if (bestTri < 0) {
@@ -231,21 +205,14 @@ PT_ApplyTexTransform
 */
 __device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& material, float& tu, float& tv) {
 	const float* xf = material.texTransform;
-	if (xf[0] == 1.0f && xf[1] == 1.0f && xf[2] == 0.0f && xf[3] == 0.0f && xf[4] == 0.0f) {
+	if (xf[0] == 1.0f && xf[1] == 0.0f && xf[2] == 0.0f
+		&& xf[3] == 0.0f && xf[4] == 1.0f && xf[5] == 0.0f) {
 		return;
 	}
-	tu *= xf[0];
-	tv *= xf[1];
-	if (xf[2] != 0.0f) {
-		float sinA, cosA;
-		sincosf(xf[2], &sinA, &cosA);
-		const float uRot = tu * cosA - tv * sinA;
-		const float vRot = tu * sinA + tv * cosA;
-		tu = uRot;
-		tv = vRot;
-	}
-	tu += xf[3];
-	tv += xf[4];
+	const float u = xf[0] * tu + xf[1] * tv + xf[2];
+	const float v = xf[3] * tu + xf[4] * tv + xf[5];
+	tu = u;
+	tv = v;
 	tu = tu - floorf(tu);
 	tv = tv - floorf(tv);
 }
@@ -345,18 +312,15 @@ __device__ bool TraceShadow(
 	PT_InvDir(ray.direction, invD);
 	const float tMin = fmaxf(ray.tMin, ray.worldTMin);
 
-	int stack[PT_BVH_STACK];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
-
-	while (stackPtr > 0) {
-		const ptBVHNode_t& node = nodes[stack[--stackPtr]];
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = nodes[nodeIdx];
 		if (!PT_RayBox(ray.origin, invD, node.bounds, tMin, ray.tMax)) {
+			nodeIdx = node.escapeIndex;
 			continue;
 		}
 
 		if (node.leftChild != -1) {
-			PT_PushChildren(node, nodes, ray.origin, ray.direction, stack, stackPtr);
+			nodeIdx = node.leftChild;
 			continue;
 		}
 
@@ -377,6 +341,7 @@ __device__ bool TraceShadow(
 				return false;
 			}
 		}
+		nodeIdx = node.escapeIndex;
 	}
 
 	return true;
@@ -1007,10 +972,12 @@ __global__ void PathTracingKernel(
 		color[0] = color[1] = color[2] = 0.0f;
 	}
 
-	// additive temporal accumulation
-	framebuffer[pixelIndex + 0] += color[0];
-	framebuffer[pixelIndex + 1] += color[1];
-	framebuffer[pixelIndex + 2] += color[2];
+	// Running mean avoids the precision loss of an ever-growing frame sum.
+	const float oldWeight = (float)frameIndex;
+	const float newWeight = 1.0f / (oldWeight + 1.0f);
+	framebuffer[pixelIndex + 0] += (color[0] - framebuffer[pixelIndex + 0]) * newWeight;
+	framebuffer[pixelIndex + 1] += (color[1] - framebuffer[pixelIndex + 1]) * newWeight;
+	framebuffer[pixelIndex + 2] += (color[2] - framebuffer[pixelIndex + 2]) * newWeight;
 	framebuffer[pixelIndex + 3] = 1.0f;
 }
 
@@ -1026,8 +993,7 @@ __global__ void ToneMappingKernel(
 	int height,
 	float exposure,
 	float gamma,
-	int toneMapMode,
-	int frameCount
+	int toneMapMode
 ) {
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1036,10 +1002,9 @@ __global__ void ToneMappingKernel(
 
 	int pixelIndex = (y * width + x) * 4;
 
-	float invFrameCount = 1.0f / fmaxf(1.0f, (float)frameCount);
-	float r = hdrBuffer[pixelIndex + 0] * invFrameCount;
-	float g = hdrBuffer[pixelIndex + 1] * invFrameCount;
-	float b = hdrBuffer[pixelIndex + 2] * invFrameCount;
+	float r = hdrBuffer[pixelIndex + 0];
+	float g = hdrBuffer[pixelIndex + 1];
+	float b = hdrBuffer[pixelIndex + 2];
 
 	// apply exposure
 	r *= exposure;
