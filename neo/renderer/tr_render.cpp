@@ -940,22 +940,17 @@ void RB_DrawView( const void *data ) {
 	RB_ShowOverdraw();
 
 	// render the scene, jumping to the hardware specific interaction renderers
-#ifdef HAVE_CUDA
-	extern idCVar r_cuDraw;
-	if ( r_cuDraw.GetBool() && backEnd.viewDef->viewEntitys ) {
-		// Use CUDA renderer
-		RB_CUDA_DrawView();
-	} else
+#ifdef HAVE_PATHTRACER
+	if ( !RB_PT_DrawView() )
 #endif
 	{
-		// Use standard OpenGL renderer
 		RB_STD_DrawView();
 	}
 
-#ifdef HAVE_CUDA
-	// drive statemachines for CUDA renderer
-	RB_CUDA_CompareCheck();
-	RB_CUDA_SequenceCheck();
+#ifdef HAVE_PATHTRACER
+	// drive the path tracer compare / sequence state machines
+	RB_PT_CompareCheck();
+	RB_PT_SequenceCheck();
 #endif
 
 	RB_GLSequenceCheck();

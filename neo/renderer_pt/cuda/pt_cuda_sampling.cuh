@@ -5,9 +5,9 @@
 #include <device_launch_parameters.h>
 #include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
-#include "renderer_cuda/cu_renderer_material.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_material.cuh"
 
 /*
 =================================================================================
@@ -33,7 +33,7 @@ __device__ void SampleHemisphere(
 
 	float sinTheta = sqrtf(r1);
 	float cosTheta = sqrtf(1.0f - r1);
-	float phi = 2.0f * M_PI * r2;
+	float phi = 2.0f * PT_PI * r2;
 
 	// build orthonormal basis from normal
 	float upX, upY, upZ;
@@ -63,7 +63,7 @@ __device__ void SampleHemisphere(
 	direction[2] = sinTheta * cosP * tZ + sinTheta * sinP * bZ + cosTheta * normal[2];
 
 	// PDF for cosine-weighted sampling: cosTheta / pi
-	pdf = cosTheta / M_PI;
+	pdf = cosTheta / PT_PI;
 }
 
 /*
@@ -75,7 +75,7 @@ __device__ inline float HenyeyGreenstein(float cosTheta, float g) {
 	float g2 = g * g;
 	float denom = 1.0f + g2 - 2.0f * g * cosTheta;
 	denom = fmaxf(denom, 1e-6f);
-	return (1.0f - g2) / (4.0f * M_PI * powf(denom, 1.5f));
+	return (1.0f - g2) / (4.0f * PT_PI * powf(denom, 1.5f));
 }
 
 /*
@@ -83,7 +83,7 @@ __device__ inline float HenyeyGreenstein(float cosTheta, float g) {
 Spotlight attenuation (smoothstep cone)
 =================================================================================
 */
-__device__ float SpotlightAttenuation(const cudaLight_t& light, const float* toSurface) {
+__device__ float SpotlightAttenuation(const ptLight_t& light, const float* toSurface) {
 	// compute angle between the vector from light to surface and the light direction
 	float cosAngle = dot3(toSurface, light.direction);
 
@@ -119,7 +119,7 @@ Compute projected texture UV coordinates using Doom 3's lightProject planes.
 =================================================================================
 */
 __device__ bool SampleLightProjectionUV(
-	const cudaLight_t& light,
+	const ptLight_t& light,
 	const float* worldPos,
 	float& u,
 	float& v,
@@ -170,7 +170,7 @@ JitterLightPosition - Area light sampling for soft shadows
 =================================================================================
 */
 __device__ void JitterLightPosition(
-	const cudaLight_t& light,
+	const ptLight_t& light,
 	curandState* randState,
 	float* jitteredPos
 ) {
@@ -218,15 +218,15 @@ SampleVolumetricScattering
 =================================================================================
 */
 __device__ void SampleVolumetricScattering(
-	const cudaLight_t& light,
+	const ptLight_t& light,
 	const float* rayOrigin,
 	const float* rayDirection,
 	float rayLength,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* nodes,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* nodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
 	curandState* randState,
 	float* scattering,
@@ -302,7 +302,7 @@ __device__ void SampleVolumetricScattering(
 		}
 
 		// shadow ray from sample to light
-		cudaRay_t shadowRay;
+		ptRay_t shadowRay;
 		shadowRay.origin[0] = samplePos[0];
 		shadowRay.origin[1] = samplePos[1];
 		shadowRay.origin[2] = samplePos[2];
@@ -316,7 +316,7 @@ __device__ void SampleVolumetricScattering(
 		const int MAX_VOL_SHADOW_STEPS = 4;
 
 		for (int ss = 0; ss < MAX_VOL_SHADOW_STEPS; ss++) {
-			cudaHitInfo_t shadowHit;
+			ptHitInfo_t shadowHit;
 			shadowHit.hit = false;
 			shadowHit.t = shadowRay.tMax;
 
@@ -324,13 +324,13 @@ __device__ void SampleVolumetricScattering(
 				break;
 			}
 
-			const cudaMaterial_t& hitMat = materials[shadowHit.materialIndex];
+			const ptMaterial_t& hitMat = materials[shadowHit.materialIndex];
 
 			if (hitMat.noShadows || hitMat.isAmbientOnly || hitMat.blendMode == 2) {
 				shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 				shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 				shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-				shadowRay.tMax = lightDist - shadowHit.t;
+				shadowRay.tMax -= shadowHit.t;
 				if (shadowRay.tMax < 0.01f) break;
 				continue;
 			}
@@ -342,7 +342,7 @@ __device__ void SampleVolumetricScattering(
 					shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 					shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 					shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-					shadowRay.tMax = lightDist - shadowHit.t;
+					shadowRay.tMax -= shadowHit.t;
 					if (shadowRay.tMax < 0.01f) break;
 					continue;
 				}
@@ -354,7 +354,7 @@ __device__ void SampleVolumetricScattering(
 				shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 				shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 				shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-				shadowRay.tMax = lightDist - shadowHit.t;
+				shadowRay.tMax -= shadowHit.t;
 				if (shadowRay.tMax < 0.01f) break;
 				continue;
 			}
@@ -371,7 +371,7 @@ __device__ void SampleVolumetricScattering(
 				shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 				shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 				shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-				shadowRay.tMax = lightDist - shadowHit.t;
+				shadowRay.tMax -= shadowHit.t;
 				if (shadowRay.tMax < 0.01f) break;
 				continue;
 			}
@@ -448,14 +448,14 @@ SampleDirectLight - Transparency-aware direct light sampling
 =================================================================================
 */
 __device__ void SampleDirectLight(
-	const cudaLight_t& light,
+	const ptLight_t& light,
 	const float* position,
 	const float* normal,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* nodes,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* nodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
 	curandState* randState,
 	float* radiance
@@ -516,7 +516,7 @@ __device__ void SampleDirectLight(
 	}
 
 	// shadow ray
-	cudaRay_t shadowRay;
+	ptRay_t shadowRay;
 	shadowRay.origin[0] = position[0] + normal[0] * g_rayOffset;
 	shadowRay.origin[1] = position[1] + normal[1] * g_rayOffset;
 	shadowRay.origin[2] = position[2] + normal[2] * g_rayOffset;
@@ -531,7 +531,7 @@ __device__ void SampleDirectLight(
 	const int MAX_SHADOW_STEPS = 8;
 
 	for (int step = 0; step < MAX_SHADOW_STEPS; step++) {
-		cudaHitInfo_t shadowHit;
+		ptHitInfo_t shadowHit;
 		shadowHit.hit = false;
 		shadowHit.t = shadowRay.tMax;
 
@@ -539,13 +539,13 @@ __device__ void SampleDirectLight(
 			break;
 		}
 
-		const cudaMaterial_t& hitMat = materials[shadowHit.materialIndex];
+		const ptMaterial_t& hitMat = materials[shadowHit.materialIndex];
 
 		if (hitMat.noShadows) {
 			shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 			shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 			shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-			shadowRay.tMax = distance - shadowHit.t;
+			shadowRay.tMax -= shadowHit.t;
 			if (shadowRay.tMax < 0.01f) break;
 			continue;
 		}
@@ -554,7 +554,7 @@ __device__ void SampleDirectLight(
 			shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 			shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 			shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-			shadowRay.tMax = distance - shadowHit.t;
+			shadowRay.tMax -= shadowHit.t;
 			if (shadowRay.tMax < 0.01f) break;
 			continue;
 		}
@@ -563,7 +563,7 @@ __device__ void SampleDirectLight(
 			shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 			shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 			shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-			shadowRay.tMax = distance - shadowHit.t;
+			shadowRay.tMax -= shadowHit.t;
 			if (shadowRay.tMax < 0.01f) break;
 			continue;
 		}
@@ -576,7 +576,7 @@ __device__ void SampleDirectLight(
 				shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 				shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 				shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-				shadowRay.tMax = distance - shadowHit.t;
+				shadowRay.tMax -= shadowHit.t;
 				if (shadowRay.tMax < 0.01f) break;
 				continue;
 			}
@@ -613,7 +613,7 @@ __device__ void SampleDirectLight(
 			shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 			shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 			shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-			shadowRay.tMax = distance - shadowHit.t;
+			shadowRay.tMax -= shadowHit.t;
 			if (shadowRay.tMax < 0.01f) break;
 			continue;
 		}
@@ -636,7 +636,7 @@ __device__ void SampleDirectLight(
 			shadowRay.origin[0] = shadowHit.position[0] + shadowRay.direction[0] * 0.002f;
 			shadowRay.origin[1] = shadowHit.position[1] + shadowRay.direction[1] * 0.002f;
 			shadowRay.origin[2] = shadowHit.position[2] + shadowRay.direction[2] * 0.002f;
-			shadowRay.tMax = distance - shadowHit.t;
+			shadowRay.tMax -= shadowHit.t;
 			if (shadowRay.tMax < 0.01f) break;
 			continue;
 		}
@@ -697,20 +697,20 @@ __device__ void SampleIndirectLight(
 	const float* position,
 	const float* normal,
 	const float* direction,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	curandState* randState,
 	float* radiance
 ) {
 	radiance[0] = radiance[1] = radiance[2] = 0.0f;
 
-	cudaRay_t ray;
+	ptRay_t ray;
 	ray.origin[0] = position[0] + normal[0] * g_rayOffset;
 	ray.origin[1] = position[1] + normal[1] * g_rayOffset;
 	ray.origin[2] = position[2] + normal[2] * g_rayOffset;
@@ -720,7 +720,7 @@ __device__ void SampleIndirectLight(
 	ray.tMin = g_rayOffset;
 	ray.tMax = 1e10f;
 
-	cudaHitInfo_t hitInfo;
+	ptHitInfo_t hitInfo;
 	hitInfo.hit = false;
 	hitInfo.t = ray.tMax;
 
@@ -735,7 +735,7 @@ __device__ void SampleIndirectLight(
 			break;
 		}
 
-		const cudaMaterial_t& mat = materials[hitInfo.materialIndex];
+		const ptMaterial_t& mat = materials[hitInfo.materialIndex];
 
 		if (mat.noShadows) {
 			ray.origin[0] = hitInfo.position[0] + ray.direction[0] * 0.002f;
@@ -782,7 +782,7 @@ __device__ void SampleIndirectLight(
 		return;
 	}
 
-	cudaMaterial_t material = materials[hitInfo.materialIndex];
+	ptMaterial_t material = materials[hitInfo.materialIndex];
 
 	float albedo[4] = {material.albedo[0], material.albedo[1], material.albedo[2], material.albedo[3]};
 	if (material.albedoTexture >= 0) {
@@ -809,9 +809,9 @@ __device__ void SampleIndirectLight(
 			vertices, triangles, bvhNodes, triIndices, materials, textures, randState, directLight);
 
 		float lightWeight = (float)numLights;
-		radiance[0] += albedo[0] * directLight[0] * lightWeight / M_PI;
-		radiance[1] += albedo[1] * directLight[1] * lightWeight / M_PI;
-		radiance[2] += albedo[2] * directLight[2] * lightWeight / M_PI;
+		radiance[0] += albedo[0] * directLight[0] * lightWeight / PT_PI;
+		radiance[1] += albedo[1] * directLight[1] * lightWeight / PT_PI;
+		radiance[2] += albedo[2] * directLight[2] * lightWeight / PT_PI;
 	}
 
 	// clamp indirect

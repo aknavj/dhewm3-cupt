@@ -5,9 +5,9 @@
 #include <device_launch_parameters.h>
 #include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
-#include "renderer_cuda/cu_renderer_material.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_material.cuh"
 
 /*
 =================================================================================
@@ -15,15 +15,15 @@ Ray-Triangle Intersection (Möller-Trumbore algorithm)
 =================================================================================
 */
 __device__ bool IntersectTriangle(
-	const cudaRay_t& ray,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t& triangle,
-	const cudaMaterial_t* materials,
-	cudaHitInfo_t& hitInfo
+	const ptRay_t& ray,
+	const ptVertex_t* vertices,
+	const ptTriangle_t& triangle,
+	const ptMaterial_t* materials,
+	ptHitInfo_t& hitInfo
 ) {
-	const cudaVertex_t& v0 = vertices[triangle.vertexIndices[0]];
-	const cudaVertex_t& v1 = vertices[triangle.vertexIndices[1]];
-	const cudaVertex_t& v2 = vertices[triangle.vertexIndices[2]];
+	const ptVertex_t& v0 = vertices[triangle.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[triangle.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[triangle.vertexIndices[2]];
 
 	float edge1[3] = {
 		v1.position[0] - v0.position[0],
@@ -103,13 +103,13 @@ BVH Traversal
 =================================================================================
 */
 __device__ bool IntersectBVH(
-	const cudaRay_t& ray,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* nodes,
+	const ptRay_t& ray,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* nodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
-	cudaHitInfo_t& hitInfo
+	const ptMaterial_t* materials,
+	ptHitInfo_t& hitInfo
 ) {
 	bool foundHit = false;
 
@@ -119,7 +119,7 @@ __device__ bool IntersectBVH(
 
 	while (stackPtr > 0 && stackPtr < 128) {
 		int nodeIndex = stack[--stackPtr];
-		const cudaBVHNode_t& node = nodes[nodeIndex];
+		const ptBVHNode_t& node = nodes[nodeIndex];
 
 		float tmin = ray.tMin;
 		float tmax = foundHit ? hitInfo.t : ray.tMax;
@@ -156,8 +156,8 @@ __device__ bool IntersectBVH(
 			}
 		} else {
 			if (stackPtr <= 126) {
-				const cudaBVHNode_t& leftNode = nodes[node.leftChild];
-				const cudaBVHNode_t& rightNode = nodes[node.rightChild];
+				const ptBVHNode_t& leftNode = nodes[node.leftChild];
+				const ptBVHNode_t& rightNode = nodes[node.rightChild];
 
 				float leftDot =
 					((leftNode.bounds[0] + leftNode.bounds[3]) - 2.0f * ray.origin[0]) * ray.direction[0] +
@@ -185,7 +185,7 @@ __device__ bool IntersectBVH(
 }
 
 // include sampling after intersection is defined (sampling calls IntersectBVH)
-#include "renderer_cuda/cu_renderer_sampling.cuh"
+#include "renderer_pt/cuda/pt_cuda_sampling.cuh"
 
 /*
 =================================================================================
@@ -193,47 +193,18 @@ PathTracingKernel - Full PBR path tracing
 =================================================================================
 */
 __global__ void PathTracingKernel(
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	int width,
-	int height,
-	const float* cameraPos,
-	const float* cameraForward,
-	const float* cameraRight,
-	const float* cameraUp,
-	float fov,
-	float fovY,
-	int samplesPerPixel,
-	int maxDepth,
-	int maxLightSamples,
-	int frameIndex,
-	float emissionBoost,
-	float indirectProb,
-	int rrEnabled,
-	int rrMinBounces,
-	float rrSurvivalMin,
-	float earlyTermThreshold,
-	float fireflyClamp,
-	float throughputClamp,
-	float rayOffset,
-	float specularBoost,
-	float skyIntensity,
-	const float* skyColorZenith,
-	const float* skyColorHorizon,
-	const float* skyColorGround,
-	float volumetricDensity,
-	int volumetricSteps,
-	float volumetricAnisotropy,
-	float volFalloff,
-	float volMaxDist
+	const ptRenderParams_t params
 ) {
+	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -256,10 +227,10 @@ __global__ void PathTracingKernel(
 		float u = ((float)(x) + 0.5f + jitterX) / (float)width * 2.0f - 1.0f;
 		float v = ((float)(y) + 0.5f + jitterY) / (float)height * 2.0f - 1.0f;
 
-		float tanHalfFovX = tanf(fov * (float)M_PI / 360.0f);
-		float tanHalfFovY = tanf(fovY * (float)M_PI / 360.0f);
+		float tanHalfFovX = tanf(fov * PT_PI / 360.0f);
+		float tanHalfFovY = tanf(fovY * PT_PI / 360.0f);
 
-		cudaRay_t ray;
+		ptRay_t ray;
 		ray.origin[0] = cameraPos[0];
 		ray.origin[1] = cameraPos[1];
 		ray.origin[2] = cameraPos[2];
@@ -278,7 +249,7 @@ __global__ void PathTracingKernel(
 		int depth = 0;
 		const int maxTransparentPasses = maxDepth * 8;  // generous budget for overlapping particles/decals
 		for (int iteration = 0; iteration < maxTransparentPasses && depth < maxDepth; iteration++) {
-			cudaHitInfo_t hitInfo;
+			ptHitInfo_t hitInfo;
 			hitInfo.hit = false;
 			hitInfo.t = ray.tMax;
 			hitInfo.materialIndex = 0;
@@ -310,7 +281,7 @@ __global__ void PathTracingKernel(
 				break;
 			}
 
-			const cudaMaterial_t& material = materials[hitInfo.materialIndex];
+			const ptMaterial_t& material = materials[hitInfo.materialIndex];
 
 			// ---------------------------------------------------------------
 			// Apply texture transforms to UV
@@ -431,10 +402,10 @@ __global__ void PathTracingKernel(
 			// Vertex color
 			// ---------------------------------------------------------------
 			if (material.useVertexColor) {
-				const cudaTriangle_t& tri = triangles[hitInfo.triangleIndex];
-				const cudaVertex_t& vert0 = vertices[tri.vertexIndices[0]];
-				const cudaVertex_t& vert1 = vertices[tri.vertexIndices[1]];
-				const cudaVertex_t& vert2 = vertices[tri.vertexIndices[2]];
+				const ptTriangle_t& tri = triangles[hitInfo.triangleIndex];
+				const ptVertex_t& vert0 = vertices[tri.vertexIndices[0]];
+				const ptVertex_t& vert1 = vertices[tri.vertexIndices[1]];
+				const ptVertex_t& vert2 = vertices[tri.vertexIndices[2]];
 
 				float bw = hitInfo.barycentrics[0];
 				float bu = hitInfo.barycentrics[1];

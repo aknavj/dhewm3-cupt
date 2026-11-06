@@ -656,6 +656,7 @@ set(src_renderer
 	renderer/tr_orderIndexes.cpp
 	renderer/tr_polytope.cpp
 	renderer/tr_render.cpp
+	renderer/tr_render_gl_stats.cpp
 	renderer/tr_rendertools.cpp
 	renderer/tr_shadowbounds.cpp
 	renderer/tr_stencilshadow.cpp
@@ -679,32 +680,32 @@ function(add_globbed_headers SRCLIST PATHPREFIX)
 endfunction()
 
 
-# Add CUDA path tracer source files if enabled
+# Path tracer (renderer_pt/): API-agnostic front end + scene builder, with one
+# subdirectory per compute backend. Each backend sets HAVE_<API> and contributes
+# host sources to src_renderer and device sources to src_renderer_pt_device.
+set(src_renderer_pt_device "")
 if(HAVE_CUDA)
-	add_definitions(-DHAVE_CUDA)
+	add_definitions(-DHAVE_PATHTRACER -DHAVE_CUDA)
 
 	list(APPEND src_renderer
-		renderer_cuda/cu_renderer.cpp
-		renderer_cuda/cu_renderer_frame.cpp
-		renderer_cuda/cu_renderer_geometry.cpp
-		renderer_cuda/cu_renderer_texture.cpp
-		renderer_cuda/cu_renderer_material.cpp
-		renderer_cuda/cu_renderer_light.cpp
-		renderer_cuda/cu_renderer_bvh.cpp
-		renderer_cuda/tr_backend_cuda.cpp
-		renderer_cuda/tr_render_cu_stats.cpp
-		renderer_cuda/tr_render_gl_stats.cpp
+		renderer_pt/pt_render.cpp
+		renderer_pt/pt_commands.cpp
+		renderer_pt/pt_scene.cpp
+		renderer_pt/pt_scene_material.cpp
+		renderer_pt/cuda/pt_backend_cuda.cpp
 	)
 
-	# CUDA kernel file
-	set(src_renderer_cuda
-		renderer_cuda/cu_renderer_main.cu
-		renderer_cuda/cu_renderer_lbvh.cu
+	list(APPEND src_renderer_pt_device
+		renderer_pt/cuda/pt_cuda_kernels.cu
+		renderer_pt/cuda/pt_cuda_lbvh.cu
 	)
 
-	# Set CUDA compilation flags
 	set(CMAKE_CUDA_STANDARD 17)
-	set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+		set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+	endif()
+
+	add_globbed_headers(src_renderer "renderer_pt")
 endif()
 
 add_globbed_headers(src_renderer "renderer")
@@ -1350,7 +1351,7 @@ if(CORE)
 		${src_sys_core}
 		${src_imgui}
 		${src_editor_tools}
-		${src_renderer_cuda}
+		${src_renderer_pt_device}
 	)
 	
 	if(MSVC AND CMAKE_MAJOR_VERSION GREATER 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_VERSION GREATER_EQUAL 6 ))

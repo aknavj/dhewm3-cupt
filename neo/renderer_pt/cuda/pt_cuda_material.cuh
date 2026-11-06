@@ -3,8 +3,8 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
 
 /*
 =================================================================================
@@ -78,7 +78,7 @@ __device__ inline float DistributionGGX(float NdotH, float roughness) {
 	float NdotH2 = NdotH * NdotH;
 
 	float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
-	denom = M_PI * denom * denom;
+	denom = PT_PI * denom * denom;
 
 	return a2 / fmaxf(denom, 0.0001f);
 }
@@ -106,7 +106,7 @@ __device__ void EvaluateMaterial(
 	float* brdf
 ) {
 	float ndotwi = fmaxf(0.0f, dot3(normal, wi));
-	float diffuse = ndotwi / M_PI;
+	float diffuse = ndotwi / PT_PI;
 
 	brdf[0] = albedo[0] * diffuse;
 	brdf[1] = albedo[1] * diffuse;
@@ -174,9 +174,9 @@ __device__ void EvaluatePBRMaterial(
 
 	// Lambertian diffuse: albedo / pi
 	float diff[3];
-	diff[0] = kD[0] * albedo[0] / M_PI;
-	diff[1] = kD[1] * albedo[1] / M_PI;
-	diff[2] = kD[2] * albedo[2] / M_PI;
+	diff[0] = kD[0] * albedo[0] / PT_PI;
+	diff[1] = kD[1] * albedo[1] / PT_PI;
+	diff[2] = kD[2] * albedo[2] / PT_PI;
 
 	// return pure BRDF f(wo,wi) = diffuse + specular (NO NdotL here)
 	brdf[0] = diff[0] + specular[0];

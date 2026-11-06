@@ -1,14 +1,14 @@
 #include "sys/platform.h"
 
-#ifdef HAVE_CUDA
+#ifdef HAVE_PATHTRACER
 
 #include "framework/Console.h"
 #include "renderer/tr_local.h"
-#include "renderer_cuda/cu_renderer.h"
+#include "renderer_pt/pt_render.h"
 
 /*
 ========================
-CUDA Compare Mode
+Path Tracer Compare Mode
 ========================
 */
 
@@ -28,17 +28,17 @@ static idStr cuCmp_cuFilename;
 static int cuCmp_screenshotNumber = 0;
 
 // extern console variables
-extern idCVar r_cuDraw;
-extern idCVar r_cuAccumulation;
+extern idCVar r_ptDraw;
+extern idCVar r_ptAccumulation;
 
 /*
 ========================
-R_CUDA_Compare_f
+R_PT_Compare_f
 ========================
 */
-void R_CUDA_Compare_f(const idCmdArgs& args) {
-	if (!g_cuRenderer) {
-		common->Printf("CUDA renderer is not active\n");
+void R_PT_Compare_f(const idCmdArgs& args) {
+	if (!RB_PT_IsSupported()) {
+		common->Printf("Path tracer is not available (no usable r_ptBackend)\n");
 		return;
 	}
 
@@ -64,12 +64,12 @@ void R_CUDA_Compare_f(const idCmdArgs& args) {
 	}
 
 	cuCmp_glFilename = va("screenshots/compare_%04d_opengl.%s", cuCmp_screenshotNumber, ext);
-	cuCmp_cuFilename = va("screenshots/compare_%04d_cu_%dspp.%s", cuCmp_screenshotNumber, cuCmp_targetSamples, ext);
+	cuCmp_cuFilename = va("screenshots/compare_%04d_pt_%dspp.%s", cuCmp_screenshotNumber, cuCmp_targetSamples, ext);
 
-	common->Printf("\n=== CUDA Compare ===");
+	common->Printf("\n=== Path Tracer Compare ===");
 	common->Printf("\n  Target samples: %d", cuCmp_targetSamples);
 	common->Printf("\n  OpenGL file:    %s", cuCmp_glFilename.c_str());
-	common->Printf("\n  CUDA file:      %s", cuCmp_cuFilename.c_str());
+	common->Printf("\n  Path tracer:    %s", cuCmp_cuFilename.c_str());
 	common->Printf("\n==============================\n");
 
 	// close the console so it doesn't appear in the screenshot
@@ -81,15 +81,15 @@ void R_CUDA_Compare_f(const idCmdArgs& args) {
 
 /*
 ========================
-RB_CUDA_CompareCheck
+RB_PT_CompareCheck
 ========================
 */
-void RB_CUDA_CompareCheck( void ) {
+void RB_PT_CompareCheck( void ) {
 	switch (cuCmp_state) {
 		// switch to OpenGL renderer
 		case CUCOMP_SWITCH_TO_GL:
 		{
-			r_cuDraw.SetBool(false);
+			r_ptDraw.SetBool(false);
 			cuCmp_glFramesWaited = 0;
 			cuCmp_state = CUCOMP_WAIT_GL_FRAME;
 			common->Printf("[cucomp] Switching to OpenGL renderer...\n");
@@ -113,7 +113,7 @@ void RB_CUDA_CompareCheck( void ) {
 			tr.TakeScreenshot(glConfig.vidWidth, glConfig.vidHeight, cuCmp_glFilename.c_str(), 1, NULL);
 			common->Printf("[cucomp] OpenGL screenshot saved: %s\n", cuCmp_glFilename.c_str());
 			// switch back to path tracer
-			r_cuDraw.SetBool(true);
+			r_ptDraw.SetBool(true);
 			cuCmp_state = CUCOMP_WAIT_CU_SAMPLES;
 			common->Printf("[cucomp] Switching to path tracer, accumulating %d samples...\n", cuCmp_targetSamples);
 			break;
@@ -122,8 +122,8 @@ void RB_CUDA_CompareCheck( void ) {
 		// check if the path tracer has accumulated enough samples
 		case CUCOMP_WAIT_CU_SAMPLES:
 		{
-			if (g_cuRenderer) {
-				int currentSamples = g_cuRenderer->GetAccumulatedFrames();
+			if (RB_PT_GetBackend()) {
+				int currentSamples = RB_PT_GetBackend()->GetAccumulatedFrames();
 				if (currentSamples > 0 && currentSamples % (cuCmp_targetSamples / 10 + 1) == 0) {
 					common->Printf("[cucomp] Accumulating... %d / %d samples\n", currentSamples, cuCmp_targetSamples);
 				}
@@ -157,7 +157,7 @@ void RB_CUDA_CompareCheck( void ) {
 
 /*
 ========================
-CUDA Sequence Renderer
+Path Tracer Sequence Renderer
 ========================
 */
 
@@ -181,37 +181,37 @@ static int cuSeq_waitCounter = 0;
 static int cuSeq_startTime = 0;
 static int cuSeq_saved_fixedTic = 0;
 static bool cuSeq_saved_stopTime = false;
-static bool cuSeq_saved_cuDraw = false;
+static bool cuSeq_saved_ptDraw = false;
 static bool cuSeq_saved_accumulation = false;
 
 /*
 ========================
-R_CUDA_Sequence_f
+R_PT_Sequence_f
 ========================
 */
-void R_CUDA_Sequence_f(const idCmdArgs& args) {
-	if (!g_cuRenderer) {
-		common->Printf("CUDA renderer is not active\n");
+void R_PT_Sequence_f(const idCmdArgs& args) {
+	if (!RB_PT_IsSupported()) {
+		common->Printf("Path tracer is not available (no usable r_ptBackend)\n");
 		return;
 	}
 
 	if (cuSeq_state != CUSEQ_IDLE) {
-		common->Printf("[cuseq] Sequence render already in progress. Use r_cuAbort to cancel.\n");
+		common->Printf("[cuseq] Sequence render already in progress. Use r_ptAbort to cancel.\n");
 		return;
 	}
 
 	if (cuCmp_state != CUCOMP_IDLE) {
-		common->Printf("[cuseq] A comparison (r_cuCompare) is in progress. Abort it first.\n");
+		common->Printf("[cuseq] A comparison (r_ptCompare) is in progress. Abort it first.\n");
 		return;
 	}
 
 	if (args.Argc() < 3) {
-		common->Printf("Usage: r_cuSequence <frame_start> <frame_end> [samples]\n");
+		common->Printf("Usage: r_ptSequence <frame_start> <frame_end> [samples]\n");
 		common->Printf("  frame_start  - First game frame to render (0+)\n");
 		common->Printf("  frame_end    - Last game frame to render (inclusive)\n");
 		common->Printf("  samples      - Path tracer samples per frame (default 256)\n");
 		common->Printf("\nThe game will be paused and single-stepped forward between frames.\n");
-		common->Printf("Output: screenshots/cuseq_NNNNN.<ext>\n");
+		common->Printf("Output: screenshots/ptseq_NNNNN.<ext>\n");
 		return;
 	}
 
@@ -235,13 +235,13 @@ void R_CUDA_Sequence_f(const idCmdArgs& args) {
 
 	int totalFrames = cuSeq_frameEnd - cuSeq_frameStart + 1;
 
-	common->Printf("\n=== CUDA Sequence Render ===\n");
+	common->Printf("\n=== Path Tracer Sequence Render ===\n");
 	common->Printf("  Frames:        %d - %d (%d total)\n", cuSeq_frameStart, cuSeq_frameEnd, totalFrames);
 	common->Printf("  Samples/frame: %d\n", cuSeq_targetSamples);
 	if (cuSeq_frameStart > 0) {
 		common->Printf("  Fast-forward:  %d frames via OpenGL\n", cuSeq_frameStart);
 	}
-	common->Printf("  Output:        screenshots/cuseq_NNNNN.<ext>\n");
+	common->Printf("  Output:        screenshots/ptseq_NNNNN.<ext>\n");
 	common->Printf("============================\n\n");
 
 	// close console so it doesn't appear in screenshots
@@ -253,10 +253,10 @@ void R_CUDA_Sequence_f(const idCmdArgs& args) {
 
 /*
 ========================
-RB_CUDA_SequenceCheck
+RB_PT_SequenceCheck
 ========================
 */
-void RB_CUDA_SequenceCheck( void ) {
+void RB_PT_SequenceCheck( void ) {
 	if (cuSeq_state == CUSEQ_IDLE) {
 		return;
 	}
@@ -269,21 +269,21 @@ void RB_CUDA_SequenceCheck( void ) {
             idCVar* stopTimeCVar = cvarSystem->Find("g_stoptime");
             cuSeq_saved_stopTime = stopTimeCVar ? stopTimeCVar->GetBool() : false;
             cuSeq_saved_fixedTic = cvarSystem->GetCVarInteger("com_fixedTic");
-            cuSeq_saved_cuDraw = r_cuDraw.GetBool();
-            cuSeq_saved_accumulation = r_cuAccumulation.GetBool();
+            cuSeq_saved_ptDraw = r_ptDraw.GetBool();
+            cuSeq_saved_accumulation = r_ptAccumulation.GetBool();
 
             // set com_fixedTic 1 for deterministic single-tick stepping
             cvarSystem->SetCVarInteger("com_fixedTic", 1);
 
             // force accumulation on — without this, RenderView() resets accum_frame
             // to 0 every frame and the sequence never reaches its sample target
-            r_cuAccumulation.SetBool(true);
+            r_ptAccumulation.SetBool(true);
 
             cuSeq_startTime = Sys_Milliseconds();
 
             if (cuSeq_frameStart > 0) {
                 // switch to GL for fast-forward
-                r_cuDraw.SetBool(false);
+                r_ptDraw.SetBool(false);
 
                 // unpause game to let it run forward
                 if (stopTimeCVar) {
@@ -295,14 +295,14 @@ void RB_CUDA_SequenceCheck( void ) {
                 common->Printf("[cuseq] Fast-forwarding to frame %d using OpenGL renderer...\n", cuSeq_frameStart);
             } else {
                 // start from frame 0 — enable path tracer and freeze immediately
-                r_cuDraw.SetBool(true);
+                r_ptDraw.SetBool(true);
                 if (stopTimeCVar) {
                     stopTimeCVar->SetBool(true);
                 }
                 cuSeq_currentFrame = 0;
                 // reset accumulation for first frame
-                if (g_cuRenderer) {
-                    g_cuRenderer->ResetAccumulation();
+                if (RB_PT_GetBackend()) {
+                    RB_PT_GetBackend()->ResetAccumulation();
                 }
                 cuSeq_state = CUSEQ_ACCUMULATE;
                 common->Printf("[cuseq] Frame %d / %d: accumulating %d samples...\n",
@@ -314,8 +314,8 @@ void RB_CUDA_SequenceCheck( void ) {
         case CUSEQ_ACCUMULATE: 
         {
             // accumulate path tracer samples on the frozen game frame
-            if (g_cuRenderer) {
-                int currentSamples = g_cuRenderer->GetAccumulatedFrames();
+            if (RB_PT_GetBackend()) {
+                int currentSamples = RB_PT_GetBackend()->GetAccumulatedFrames();
 
                 // progress reporting every 25%
                 int quarter = cuSeq_targetSamples / 4;
@@ -348,7 +348,7 @@ void RB_CUDA_SequenceCheck( void ) {
                 default: ext = "tga"; break;
             }
 
-            idStr filename = va("screenshots/cuseq_%05d.%s", cuSeq_currentFrame, ext);
+            idStr filename = va("screenshots/ptseq_%05d.%s", cuSeq_currentFrame, ext);
             tr.TakeScreenshot(glConfig.vidWidth, glConfig.vidHeight, filename.c_str(), 1, NULL);
 
             int totalFrames = cuSeq_frameEnd - cuSeq_frameStart + 1;
@@ -408,14 +408,14 @@ void RB_CUDA_SequenceCheck( void ) {
                 cuSeq_state = CUSEQ_ADVANCE_UNPAUSE;
             } else {
                 // we've reached a renderable frame — switch to path tracer and accumulate
-                if (!r_cuDraw.GetBool()) {
-                    r_cuDraw.SetBool(true);
+                if (!r_ptDraw.GetBool()) {
+                    r_ptDraw.SetBool(true);
                     common->Printf("[cuseq] Reached frame %d, switching to path tracer.\n",
                         cuSeq_currentFrame);
                 }
                 // reset accumulation so samples start from 0 for this new game frame
-                if (g_cuRenderer) {
-                    g_cuRenderer->ResetAccumulation();
+                if (RB_PT_GetBackend()) {
+                    RB_PT_GetBackend()->ResetAccumulation();
                 }
                 cuSeq_state = CUSEQ_ACCUMULATE;
                 common->Printf("[cuseq] Frame %d / %d: accumulating %d samples...\n",
@@ -442,22 +442,22 @@ void RB_CUDA_SequenceCheck( void ) {
                 restoreFixedTic = 0;
             }
             cvarSystem->SetCVarInteger("com_fixedTic", restoreFixedTic);
-            r_cuDraw.SetBool(cuSeq_saved_cuDraw);
-            r_cuAccumulation.SetBool(cuSeq_saved_accumulation);
+            r_ptDraw.SetBool(cuSeq_saved_ptDraw);
+            r_ptAccumulation.SetBool(cuSeq_saved_accumulation);
 
-            common->Printf("[cuseq] Restored: g_stopTime=%d, com_fixedTic=%d, r_cuDraw=%d\n",
-                (int)cuSeq_saved_stopTime, restoreFixedTic, (int)cuSeq_saved_cuDraw);
+            common->Printf("[cuseq] Restored: g_stopTime=%d, com_fixedTic=%d, r_ptDraw=%d\n",
+                (int)cuSeq_saved_stopTime, restoreFixedTic, (int)cuSeq_saved_ptDraw);
 
             int totalFrames = cuSeq_frameEnd - cuSeq_frameStart + 1;
             float totalSec = (float)(Sys_Milliseconds() - cuSeq_startTime) * 0.001f;
             int totalMin = (int)(totalSec / 60.0f);
             float remSec = totalSec - (float)(totalMin * 60);
-            common->Printf("\n=== CUDA Sequence Render Complete ===\n");
+            common->Printf("\n=== Path Tracer Sequence Render Complete ===\n");
             common->Printf("  Rendered %d frames (%d - %d) at %d samples each.\n",
                 totalFrames, cuSeq_frameStart, cuSeq_frameEnd, cuSeq_targetSamples);
             common->Printf("  Total time: %dm %.1fs (%.1fs)\n", totalMin, remSec, totalSec);
             common->Printf("  Avg time/frame: %.1fs\n", totalSec / totalFrames);
-            common->Printf("  Output: screenshots/cuseq_%05d - cuseq_%05d\n",
+            common->Printf("  Output: screenshots/ptseq_%05d - ptseq_%05d\n",
                 cuSeq_frameStart, cuSeq_frameEnd);
             common->Printf("=====================================\n\n");
 
@@ -479,12 +479,12 @@ void RB_CUDA_SequenceCheck( void ) {
 
 /*
 ========================
-R_CUDA_Abort_f
+R_PT_Abort_f
 ========================
 */
-void R_CUDA_Abort_f(const idCmdArgs& args) {
-	if (!g_cuRenderer) {
-		common->Printf("CUDA renderer is not active\n");
+void R_PT_Abort_f(const idCmdArgs& args) {
+	if (!RB_PT_IsSupported()) {
+		common->Printf("Path tracer is not available (no usable r_ptBackend)\n");
 		return;
 	}
 
@@ -505,8 +505,8 @@ void R_CUDA_Abort_f(const idCmdArgs& args) {
 		int restoreFixedTic = cuSeq_saved_fixedTic;
 		if (restoreFixedTic == 1) restoreFixedTic = 0;
 		cvarSystem->SetCVarInteger("com_fixedTic", restoreFixedTic);
-		r_cuDraw.SetBool(cuSeq_saved_cuDraw);
-		r_cuAccumulation.SetBool(cuSeq_saved_accumulation);
+		r_ptDraw.SetBool(cuSeq_saved_ptDraw);
+		r_ptAccumulation.SetBool(cuSeq_saved_accumulation);
 
 		cuSeq_state = CUSEQ_IDLE;
 		common->Printf("[cuseq] Aborted. CVars restored.\n");
@@ -519,4 +519,4 @@ void R_CUDA_Abort_f(const idCmdArgs& args) {
 	}
 }
 
-#endif // HAVE_CUDA
+#endif // HAVE_PATHTRACER
