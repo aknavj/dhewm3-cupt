@@ -58,6 +58,49 @@ __device__ inline void SampleTextureSrgb(const cudaTexture_t* textures, int texI
 	color[2] = PT_SrgbToLinear(color[2]);
 }
 
+__device__ inline void SampleLightTextureSrgb(const cudaTexture_t* textures, int texIndex,
+	float u, float v, int address, float* color) {
+	if (texIndex < 0 || texIndex >= MAX_TEXTURES || !textures[texIndex].data
+		|| textures[texIndex].width <= 0 || textures[texIndex].height <= 0) {
+		color[0] = color[1] = color[2] = color[3] = 1.0f;
+		return;
+	}
+
+	const cudaTexture_t& tex = textures[texIndex];
+	if (address == PT_LIGHT_TEXTURE_CLAMP) {
+		const float halfU = 0.5f / (float)tex.width;
+		const float halfV = 0.5f / (float)tex.height;
+		u = fminf(fmaxf(u, halfU), 1.0f - halfU);
+		v = fminf(fmaxf(v, halfV), 1.0f - halfV);
+		SampleTexture(textures, texIndex, u, v, color);
+	} else if (address == PT_LIGHT_TEXTURE_BORDER) {
+		const float x = u * (float)tex.width - 0.5f;
+		const float y = v * (float)tex.height - 0.5f;
+		color[0] = color[1] = color[2] = color[3] = 0.0f;
+		if (x > -1.0f && x < (float)tex.width && y > -1.0f && y < (float)tex.height) {
+			const int x0 = (int)floorf(x);
+			const int y0 = (int)floorf(y);
+			const float fx = x - (float)x0;
+			const float fy = y - (float)y0;
+			for (int dy = 0; dy < 2; dy++) {
+				for (int dx = 0; dx < 2; dx++) {
+					const int ix = x0 + dx;
+					const int iy = y0 + dy;
+					if (ix < 0 || ix >= tex.width || iy < 0 || iy >= tex.height) continue;
+					const float weight = (dx ? fx : 1.0f - fx) * (dy ? fy : 1.0f - fy) / 255.0f;
+					const int index = (iy * tex.width + ix) * 4;
+					for (int c = 0; c < 4; c++) color[c] += tex.data[index + c] * weight;
+				}
+			}
+		}
+	} else {
+		SampleTexture(textures, texIndex, u, v, color);
+	}
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
+}
+
 /*
 =================================================================================
 PBR Material Evaluation - Cook-Torrance BRDF

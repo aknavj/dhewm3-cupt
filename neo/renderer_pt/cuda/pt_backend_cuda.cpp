@@ -486,12 +486,12 @@ bool idPathTracerBackendCUDA::UploadScene( const idPathTracerScene &scene ) {
 	numVertices = scene.Vertices().Num();
 	numTriangles = scene.Triangles().Num();
 	numMaterials = scene.Materials().Num();
-	numLights = Min( scene.Lights().Num(), PT_MAX_LIGHTS );
+	numLights = scene.Lights().Num();
 
 	if ( !Reserve( d_vertices, capVertices, Max( numVertices, 1 ), "vertices" ) ||
 		 !Reserve( d_triangles, capTriangles, Max( numTriangles, 1 ), "triangles" ) ||
 		 !Reserve( d_materials, capMaterials, Max( numMaterials, 1 ), "materials" ) ||
-		 !Reserve( d_lights, capLights, PT_MAX_LIGHTS, "lights" ) ) {
+		 !Reserve( d_lights, capLights, Max( numLights, 1 ), "lights" ) ) {
 		numVertices = numTriangles = numMaterials = numLights = 0;
 		return false;
 	}

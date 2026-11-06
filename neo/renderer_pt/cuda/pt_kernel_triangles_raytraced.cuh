@@ -379,6 +379,9 @@ __global__ void TriangleDrawRayTracedKernel(
 
 		for (int li = 0; li < numLights; li++) {
 			const ptLight_t& light = lights[li];
+			if (light.type == PT_LIGHT_AREA) {
+				continue;  // area-light sampling is implemented in path-tracing mode
+			}
 
 			float lX, lY, lZ;
 			float shadowDist;

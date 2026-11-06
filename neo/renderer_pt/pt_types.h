@@ -18,7 +18,7 @@
 */
 
 #define PT_MAX_TEXTURES			2048
-#define PT_MAX_LIGHTS			512
+#define PT_LIGHT_BUDGET			512		// emissive lights fill the remaining slots; engine lights are not capped
 #define PT_MAX_TEXTURE_SIZE		4096
 #define PT_MIN_RENDER_SIZE		64
 
@@ -30,12 +30,18 @@ enum ptLightType_t {
 	PT_LIGHT_AREA			= 2		// generated from emissive triangles
 };
 
+enum ptLightTextureAddress_t {
+	PT_LIGHT_TEXTURE_REPEAT = 0,
+	PT_LIGHT_TEXTURE_CLAMP,
+	PT_LIGHT_TEXTURE_BORDER
+};
+
 // ptTriangle_t::flags, derived from the material and the entity on the host
 enum ptTriangleFlags_t {
 	PT_TRI_WEAPON			= 1,	// view weapon (weaponDepthHack): seen by camera rays only, never occludes
 	PT_TRI_NO_OCCLUDE		= 2,	// never blocks shadow rays (noShadows, additive, unlit overlays)
 	PT_TRI_OPAQUE			= 4,	// always blocks shadow rays, no material lookup needed
-	PT_TRI_AREA_LIGHT		= 8		// also a PT_LIGHT_AREA, bounce hits skip its emission where it was sampled
+	PT_TRI_AREA_LIGHT		= 8		// also sampled as a PT_LIGHT_AREA
 };
 
 enum ptBlendMode_t {
@@ -118,12 +124,16 @@ typedef struct {
 	float intensity;
 	float radius;				// falloff boundary
 	float area[3];				// emissive triangle area
+	float areaBoundRadius;		// conservative radius around the triangle centroid
+	int areaTriangleIndex;		// emissive triangle index for PT_LIGHT_AREA
 	int textureIndex;			// light texture or -1
 	float volumetric;			// volumetric scattering intensity (0 = off)
 	float coneAngle;			// spot half angle in radians (0 = omni)
 	float coneFalloff;			// spot edge exponent
 
 	float lightProject[4][4];	// Doom 3 light projection planes (world space)
+	float projectedTextureTransform[6]; // affine transform applied after the volume test
+	int projectedTextureAddress;	// ptLightTextureAddress_t
 	int projectedTextureIndex;	// light image, sampled at the projected (s, t)
 	int falloffTextureIndex;	// falloff image, sampled at (falloff, 0.5)
 	int boxFalloff;				// attenuate by lightProject / light image / falloff image

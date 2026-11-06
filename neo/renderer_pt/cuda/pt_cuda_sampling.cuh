@@ -182,10 +182,7 @@ __device__ void JitterLightPosition(
 		return;
 	}
 
-	if (light.type == 2) {
-		return;  // area light already a point
-	}
-	if (light.type == 1) {
+	if (light.type == PT_LIGHT_DIRECTIONAL) {
 		return;  // directional light
 	}
 
@@ -221,8 +218,8 @@ attenuation. Returns 0 when the point is outside the light.
 
 boxFalloff lights reproduce the GL interaction: lightProject gives (s, t)
 for the light image and the falloff coordinate for the falloff image, both
-zero outside the light volume. The other lights use a spherical window
-(area lights) and optionally a spot cone.
+zero outside the light volume. Other non-area lights use a spherical window
+and optionally a spot cone.
 =================================================================================
 */
 __device__ float PT_LightFilter(
@@ -248,7 +245,10 @@ __device__ float PT_LightFilter(
 		}
 		float tex[4];
 		if (light.projectedTextureIndex >= 0 && textures) {
-			SampleTextureSrgb(textures, light.projectedTextureIndex, s, t, tex);
+			const float* m = light.projectedTextureTransform;
+			const float u = m[0] * s + m[1] * t + m[2];
+			const float v = m[3] * s + m[4] * t + m[5];
+			SampleLightTextureSrgb(textures, light.projectedTextureIndex, u, v, light.projectedTextureAddress, tex);
 			filter[0] *= tex[0];
 			filter[1] *= tex[1];
 			filter[2] *= tex[2];
@@ -279,7 +279,10 @@ __device__ float PT_LightFilter(
 		}
 		if (textures) {
 			float tex[4];
-			SampleTextureSrgb(textures, light.projectedTextureIndex, s, t, tex);
+			const float* m = light.projectedTextureTransform;
+			const float u = m[0] * s + m[1] * t + m[2];
+			const float v = m[3] * s + m[4] * t + m[5];
+			SampleLightTextureSrgb(textures, light.projectedTextureIndex, u, v, light.projectedTextureAddress, tex);
 			filter[0] *= tex[0];
 			filter[1] *= tex[1];
 			filter[2] *= tex[2];
@@ -308,7 +311,24 @@ used to pick which lights get shadow rays. Zero only where the light can
 not contribute at all, so importance sampling stays unbiased.
 =================================================================================
 */
-__device__ float LightImportance(const ptLight_t& light, const float* pos, const float* normal) {
+__device__ float LightImportance(const ptLight_t& light, const float* pos, const float* normal, float emissionBoost) {
+	if (light.type == PT_LIGHT_AREA) {
+		const float power = (0.2126f * light.color[0] + 0.7152f * light.color[1] + 0.0722f * light.color[2])
+			* light.area[0] * emissionBoost;
+		if (power <= 0.0f) {
+			return 0.0f;
+		}
+		const float d[3] = { light.position[0] - pos[0], light.position[1] - pos[1], light.position[2] - pos[2] };
+		const float normalDistance = dot3(normal, d);
+		// The bounding sphere must be entirely below the receiver's hemisphere.
+		if (normalDistance + light.areaBoundRadius < -1e-3f) {
+			return 0.0f;
+		}
+		const float dist2 = dot3(d, d);
+		const float cosTerm = fmaxf(normalDistance * rsqrtf(fmaxf(dist2, 1e-8f)), 0.0f) + 0.02f;
+		return power * cosTerm / (dist2 + light.area[0]);
+	}
+
 	const float power = (0.2126f * light.color[0] + 0.7152f * light.color[1] + 0.0722f * light.color[2]) * light.intensity;
 	if (power <= 0.0f) {
 		return 0.0f;
@@ -356,31 +376,6 @@ __device__ float LightImportance(const ptLight_t& light, const float* pos, const
 
 /*
 =================================================================================
-PT_AreaLightSampledFrom
-
-True when the PT_LIGHT_AREA built from this emissive triangle (see
-idPathTracerScene::AddEmissiveAreaLight) has a nonzero LightImportance at pos,
-i.e. light sampling at pos already accounts for the triangle's emission.
-=================================================================================
-*/
-__device__ bool PT_AreaLightSampledFrom(const ptVertex_t* vertices, const ptTriangle_t& tri, const float* pos) {
-	const float* p0 = vertices[tri.vertexIndices[0]].position;
-	const float* p1 = vertices[tri.vertexIndices[1]].position;
-	const float* p2 = vertices[tri.vertexIndices[2]].position;
-	const float e1[3] = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
-	const float e2[3] = { p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2] };
-	float n[3];
-	cross3(e1, e2, n);
-	const float radius = sqrtf(0.5f * length3(n));
-	const float d[3] = {
-		(p0[0] + p1[0] + p2[0]) * (1.0f / 3.0f) - pos[0],
-		(p0[1] + p1[1] + p2[1]) * (1.0f / 3.0f) - pos[1],
-		(p0[2] + p1[2] + p2[2]) * (1.0f / 3.0f) - pos[2] };
-	return length3(d) < fmaxf(radius, 1.0f);
-}
-
-/*
-=================================================================================
 PT_SelectLights
 
 Picks numPicks lights (with replacement) proportionally to LightImportance,
@@ -398,6 +393,7 @@ __device__ int PT_SelectLights(
 	const float* pos,
 	const float* normal,
 	int numPicks,
+	float emissionBoost,
 	ptRng_t* rng,
 	int* picked,
 	float* invPdf
@@ -410,7 +406,7 @@ __device__ int PT_SelectLights(
 	float pickedW[PT_MAX_LIGHT_PICKS];
 	float total = 0.0f;
 	for (int i = 0; i < numLights; i++) {
-		const float w = LightImportance(lights[i], pos, normal);
+		const float w = LightImportance(lights[i], pos, normal, emissionBoost);
 		if (w <= 0.0f) {
 			continue;
 		}
@@ -557,6 +553,7 @@ __device__ void SampleDirectLight(
 	const float* position,
 	const float* normal,
 	float worldTMin,
+	float emissionBoost,
 	const ptVertex_t* vertices,
 	const ptTriangle_t* triangles,
 	const ptBVHNode_t* nodes,
@@ -570,7 +567,23 @@ __device__ void SampleDirectLight(
 	radiance[0] = radiance[1] = radiance[2] = 0.0f;
 
 	float lightPos[3];
-	JitterLightPosition(light, rng, lightPos);
+	float bary[3] = { 0.0f, 0.0f, 0.0f };
+	if (light.type == PT_LIGHT_AREA) {
+		if (emissionBoost <= 0.0f) return;
+		const ptTriangle_t& tri = triangles[light.areaTriangleIndex];
+		const float root = sqrtf(PT_Rand(rng));
+		const float r = PT_Rand(rng);
+		bary[0] = 1.0f - root;
+		bary[1] = root * (1.0f - r);
+		bary[2] = root * r;
+		for (int c = 0; c < 3; c++) {
+			lightPos[c] = bary[0] * vertices[tri.vertexIndices[0]].position[c]
+				+ bary[1] * vertices[tri.vertexIndices[1]].position[c]
+				+ bary[2] * vertices[tri.vertexIndices[2]].position[c];
+		}
+	} else {
+		JitterLightPosition(light, rng, lightPos);
+	}
 
 	float distance;
 	if (light.type == PT_LIGHT_DIRECTIONAL) {
@@ -593,11 +606,46 @@ __device__ void SampleDirectLight(
 	if (ndotl <= 0.0f) return;
 
 	float lightColor[3];
-	const float attenuation = PT_LightFilter(light, position, distance, wi, textures, lightColor);
-	if (attenuation <= 0.0f) return;
+	float contribution;
+	if (light.type == PT_LIGHT_AREA) {
+		const float emitterCosine = fabsf(dot3(light.direction, wi));
+		if (emitterCosine <= 0.0f) return;
 
-	float contribution = light.intensity * ndotl * attenuation;
-	if (contribution > 10.0f) contribution = 10.0f;
+		const ptTriangle_t& tri = triangles[light.areaTriangleIndex];
+		const ptMaterial_t& material = materials[tri.materialIndex];
+		const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+		const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+		const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+		float tu = bary[0] * v0.texcoord[0] + bary[1] * v1.texcoord[0] + bary[2] * v2.texcoord[0];
+		float tv = bary[0] * v0.texcoord[1] + bary[1] * v1.texcoord[1] + bary[2] * v2.texcoord[1];
+		PT_ApplyTexTransform(material, tu, tv);
+
+		if (material.alphaTest > 0.0f) {
+			float alpha = material.albedo[3];
+			if (material.albedoTexture >= 0 && textures) {
+				float albedo[4];
+				SampleTexture(textures, material.albedoTexture, tu, tv, albedo);
+				alpha *= albedo[3];
+			}
+			if (material.useVertexColor) {
+				alpha *= bary[0] * v0.color[3] + bary[1] * v1.color[3] + bary[2] * v2.color[3];
+			}
+			if (alpha < material.alphaTest) return;
+		}
+
+		float glow[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		if (material.emissionTexture >= 0 && textures) {
+			SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
+		}
+		for (int c = 0; c < 3; c++) {
+			lightColor[c] = material.emission[c] * glow[c] * emissionBoost;
+		}
+		contribution = ndotl * emitterCosine * light.area[0] / (distance * distance);
+	} else {
+		const float attenuation = PT_LightFilter(light, position, distance, wi, textures, lightColor);
+		if (attenuation <= 0.0f) return;
+		contribution = fminf(light.intensity * ndotl * attenuation, 10.0f);
+	}
 
 	ptRay_t shadowRay;
 	shadowRay.origin[0] = position[0] + normal[0] * g_rayOffset;
@@ -608,6 +656,17 @@ __device__ void SampleDirectLight(
 	shadowRay.direction[2] = wi[2];
 	shadowRay.tMin = g_rayOffset;
 	shadowRay.tMax = distance - g_rayOffset;
+	if (light.type == PT_LIGHT_AREA) {
+		for (int c = 0; c < 3; c++) {
+			shadowRay.direction[c] = lightPos[c] - shadowRay.origin[c];
+		}
+		const float shadowDistance = length3(shadowRay.direction);
+		if (shadowDistance <= g_rayOffset) return;
+		for (int c = 0; c < 3; c++) {
+			shadowRay.direction[c] /= shadowDistance;
+		}
+		shadowRay.tMax = shadowDistance - g_rayOffset;
+	}
 	shadowRay.worldTMin = worldTMin;
 	shadowRay.flags = 0;
 
@@ -633,6 +692,8 @@ __device__ void SampleIndirectLight(
 	const float* normal,
 	const float* direction,
 	float worldTMin,
+	float emissionBoost,
+	bool callerSampledLights,
 	const ptVertex_t* vertices,
 	const ptTriangle_t* triangles,
 	const ptBVHNode_t* bvhNodes,
@@ -680,8 +741,12 @@ __device__ void SampleIndirectLight(
 		for (int c = 0; c < 4; c++) {
 			albedo[c] *= mat.albedo[c];
 		}
+		PT_ApplyVertexColor(mat, vertices, triangles[hitInfo.triangleIndex],
+			hitInfo.barycentrics[0], hitInfo.barycentrics[1], hitInfo.barycentrics[2], albedo);
 
-		const bool passThrough = mat.noShadows || mat.isAmbientOnly || mat.transmission > 0.5f
+		const bool decalOverlay = mat.noShadows && !mat.isAmbientOnly && mat.alphaTest == 0.0f
+			&& mat.transmission == 0.0f && mat.blendMode == PT_BLEND_OPAQUE;
+		const bool passThrough = decalOverlay || mat.isAmbientOnly || mat.transmission > 0.5f
 			|| mat.blendMode == PT_BLEND_ADD || (mat.alphaTest > 0.0f && albedo[3] < mat.alphaTest);
 		if (!passThrough) {
 			foundOpaque = true;
@@ -699,22 +764,21 @@ __device__ void SampleIndirectLight(
 	const ptMaterial_t& material = materials[hitInfo.materialIndex];
 
 	// skip emitters the caller's light sampling already covered
-	if (!(hitInfo.triFlags & PT_TRI_AREA_LIGHT)
-		|| !PT_AreaLightSampledFrom(vertices, triangles[hitInfo.triangleIndex], position)) {
+	if (!(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !callerSampledLights) {
 		float glow[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 		if (material.emissionTexture >= 0 && textures) {
 			SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
 		}
-		radiance[0] += material.emission[0] * glow[0];
-		radiance[1] += material.emission[1] * glow[1];
-		radiance[2] += material.emission[2] * glow[2];
+		radiance[0] += material.emission[0] * glow[0] * emissionBoost;
+		radiance[1] += material.emission[1] * glow[1] * emissionBoost;
+		radiance[2] += material.emission[2] * glow[2] * emissionBoost;
 	}
 
 	int pick;
 	float invPdf;
-	if (PT_SelectLights(lights, numLights, hitInfo.position, hitInfo.normal, 1, rng, &pick, &invPdf) > 0) {
+	if (PT_SelectLights(lights, numLights, hitInfo.position, hitInfo.normal, 1, emissionBoost, rng, &pick, &invPdf) > 0) {
 		float directLight[3], wi[3];
-		SampleDirectLight(lights[pick], hitInfo.position, hitInfo.normal, 0.0f,
+		SampleDirectLight(lights[pick], hitInfo.position, hitInfo.normal, 0.0f, emissionBoost,
 			vertices, triangles, bvhNodes, triIndices, materials, textures, rng, directLight, wi);
 
 		radiance[0] += albedo[0] * directLight[0] * invPdf / PT_PI;

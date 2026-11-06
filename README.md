@@ -55,12 +55,13 @@ and all GUI drawing on top of the 3D view.
   alpha test, blend modes, vertex colours, emission, glass (Fresnel + IOR). Time-varying shader
   registers are re-evaluated every frame, per entity. Inactive material slots are reused,
   and the cache grows when a view needs more simultaneously
-- **Stochastic direct lighting** with soft shadows, matching the GL light model: projected light
-  image times falloff image, stage colours and condition registers, lights picked by estimated
-  contribution. Shadow rays pass through alpha tested and translucent surfaces
+- **Stochastic direct lighting** with soft shadows: every enabled light stage, its projected
+  image and texture matrix, the engine-resolved falloff image, and `r_lightScale` contribute to
+  the lighting. Shadow rays pass through alpha tested and translucent surfaces
 - **sRGB correct shading**: textures and colours are decoded to linear before lighting
 - **First person weapon** rendered as an overlay that never gets clipped by nearby walls
-- **Indirect lighting** via cosine-weighted hemisphere sampling, plus emissive surfaces as area lights
+- **Indirect lighting** via cosine-weighted hemisphere sampling, plus textured emissive triangles
+  sampled as area lights with geometric falloff and visibility
 - **Volumetric scattering** with a ray-marched Henyey-Greenstein phase function
 - **Progressive accumulation** that resets on camera, mode, resolution or (configurable) scene
   changes, uses a running mean to preserve precision, and ramps quality over the first frames
@@ -69,6 +70,13 @@ and all GUI drawing on top of the 3D view.
   engine pointers are reused
 - **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
 - **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
+
+Generated area lights share a target budget of 512 lights with engine light stages. Engine
+light stages take priority and can grow beyond that budget; any emissive triangles that do
+not fit still contribute when hit by a bounce ray, and the renderer warns once when the budget
+is exceeded. Eligible opaque emitters are sampled on both sides,
+including their glow texture and alpha test. Transmissive emitters and no-shadow decal overlays
+are not sampled as area lights. The Whitted debug mode currently omits generated area lights.
 
 ## Building with CUDA
 
@@ -94,16 +102,23 @@ To run the material cache regression test, configure with `-DPT_MATERIAL_CACHE_T
 build the `pt_material_cache_test` target, then run `ctest -R pt_material_cache --output-on-failure`
 from the build directory. This test does not require CUDA.
 
+For the GPU lighting regression test, also configure with `-DPT_CUDA_LIGHTING_TESTS=ON`,
+build `pt_cuda_lighting_test`, and run `ctest -R pt_cuda_lighting --output-on-failure`.
+It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is available.
+
 ## Console Commands
 
 | Command | Description |
 |---------|-------------|
 | `r_ptInfo` | List compiled backends and print device / memory / timing info for the active one |
 | `r_ptReset` | Restart accumulation and drop cached materials and textures |
-| `r_ptCompare [samples]` | Save an OpenGL and a converged path-traced screenshot of the current view |
-| `r_ptSequence <start> <end> [samples]` | Path trace a range of demo frames to screenshots |
+| `r_ptCompare [frames]` | Save an OpenGL and a path-traced screenshot after the given accumulated frame count |
+| `r_ptSequence <start> <end> [frames]` | Path trace a range of demo frames to screenshots |
 | `r_ptAbort` | Abort `r_ptCompare` / `r_ptSequence` |
 | `r_glSequence` / `r_glAbort` | OpenGL counterpart of `r_ptSequence` (always available) |
+
+The comparison and sequence targets count accumulated frames, not individual samples per pixel;
+the `_spp` suffix in screenshot filenames is historical.
 
 ## Console Variables
 

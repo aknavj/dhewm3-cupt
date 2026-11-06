@@ -103,15 +103,17 @@ private:
 	// triFlags: PT_TRI_WEAPON / PT_TRI_NO_OCCLUDE from the entity, material derived flags are added
 	void					AddTriangles( const idDrawVert *verts, int numVerts, const int *indexes, int numIndexes,
 										  int materialIndex, const float *modelMatrix, int triFlags );
-	bool					AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2, int materialIndex );
+	bool					AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2,
+												  int materialIndex, int triangleIndex );
 	// a non-NULL lightProject selects the GL style box falloff (light image * falloff image)
 	void					AddLight( const idVec3 &position, const idVec3 &color, float intensity, int type,
 									  float lightRadius, const float *lightProject, int projTexIndex, int falloffTexIndex,
-									  const float *lightRadiusXYZ );
+									  const float *lightRadiusXYZ, const float *textureTransform, int textureAddress );
 	void					AddSpotLight( const idVec3 &position, const idVec3 &direction, const idVec3 &color,
 										  float intensity, float coneAngle, float coneFalloff, float lightRadius,
 										  const float *lightProject, int projTexIndex, int falloffTexIndex,
-										  const float *rightAxis, const float *upAxis );
+										  const float *rightAxis, const float *upAxis, const float *textureTransform,
+										  int textureAddress );
 
 	// per view
 	idList<ptVertex_t>		vertices;
@@ -119,6 +121,8 @@ private:
 	idList<ptLight_t>		lights;
 	idList<ptLight_t>		areaLights;			// emissive triangles, appended after real lights in EndFrame
 	idList<int>				areaLightTris;		// triangle of each areaLights entry
+	int						areaLightOverflow;
+	bool					warnedAreaLightBudget;
 	float					bounds[6];
 	unsigned int			contentHash;
 	unsigned int			structureHash;

@@ -217,6 +217,20 @@ __device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& materia
 	tv = tv - floorf(tv);
 }
 
+__device__ __forceinline__ void PT_ApplyVertexColor(
+	const ptMaterial_t& material, const ptVertex_t* vertices, const ptTriangle_t& tri,
+	float w, float u, float v, float* color
+) {
+	if (!material.useVertexColor) return;
+	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+	for (int c = 0; c < 4; c++) {
+		const float vertexColor = w * v0.color[c] + u * v1.color[c] + v * v2.color[c];
+		color[c] *= c < 3 ? PT_SrgbToLinear(vertexColor) : vertexColor;
+	}
+}
+
 /*
 =================================================================================
 PT_ShadowTransmit
@@ -251,6 +265,7 @@ __device__ bool PT_ShadowTransmit(
 		PT_ApplyTexTransform(m, tu, tv);
 		SampleTextureSrgb(textures, m.albedoTexture, tu, tv, tex);
 	}
+	PT_ApplyVertexColor(m, vertices, tri, 1.0f - u - v, u, v, tex);
 	const float alpha = m.albedo[3] * tex[3];
 
 	if (m.alphaTest > 0.0f && alpha < m.alphaTest) {
@@ -408,7 +423,7 @@ __global__ void PathTracingKernel(
 
 		float pathThroughput[3] = { 1.0f, 1.0f, 1.0f };
 		float pathRadiance[3] = { 0.0f, 0.0f, 0.0f };
-		float lastShadePos[3] = { 0.0f, 0.0f, 0.0f };	// where the previous bounce did light sampling
+		bool lastSampledLights = false;
 
 		int depth = 0;
 		const int maxTransparentPasses = maxDepth * 8;  // generous budget for overlapping particles/decals
@@ -552,27 +567,8 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			// Vertex color
 			// ---------------------------------------------------------------
-			if (material.useVertexColor) {
-				const ptTriangle_t& tri = triangles[hitInfo.triangleIndex];
-				const ptVertex_t& vert0 = vertices[tri.vertexIndices[0]];
-				const ptVertex_t& vert1 = vertices[tri.vertexIndices[1]];
-				const ptVertex_t& vert2 = vertices[tri.vertexIndices[2]];
-
-				float bw = hitInfo.barycentrics[0];
-				float bu = hitInfo.barycentrics[1];
-				float bv = hitInfo.barycentrics[2];
-
-				float vertexColor[4];
-				vertexColor[0] = bw * vert0.color[0] + bu * vert1.color[0] + bv * vert2.color[0];
-				vertexColor[1] = bw * vert0.color[1] + bu * vert1.color[1] + bv * vert2.color[1];
-				vertexColor[2] = bw * vert0.color[2] + bu * vert1.color[2] + bv * vert2.color[2];
-				vertexColor[3] = bw * vert0.color[3] + bu * vert1.color[3] + bv * vert2.color[3];
-
-				albedo[0] *= PT_SrgbToLinear(vertexColor[0]);
-				albedo[1] *= PT_SrgbToLinear(vertexColor[1]);
-				albedo[2] *= PT_SrgbToLinear(vertexColor[2]);
-				albedo[3] *= vertexColor[3];
-			}
+			PT_ApplyVertexColor(material, vertices, triangles[hitInfo.triangleIndex],
+				hitInfo.barycentrics[0], hitInfo.barycentrics[1], hitInfo.barycentrics[2], albedo);
 
 			// ---------------------------------------------------------------
 			// Alpha test: skip transparent fragments
@@ -615,10 +611,10 @@ __global__ void PathTracingKernel(
 				int picks[PT_MAX_LIGHT_PICKS];
 				float pickWeights[PT_MAX_LIGHT_PICKS];
 				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
-					min(numLights, maxLightSamples), &rng, picks, pickWeights);
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
 				for (int i = 0; i < numPicks; i++) {
 					float directLight[3], wi[3];
-					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin,
+					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
 						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
 					const float w = alpha * pickWeights[i];
 					pathRadiance[0] += pathThroughput[0] * directLight[0] * albedo[0] * w;
@@ -726,8 +722,7 @@ __global__ void PathTracingKernel(
 			// Emission
 			// ---------------------------------------------------------------
 			// skip emitters the previous bounce's light sampling already covered
-			if (depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT)
-				|| !PT_AreaLightSampledFrom(vertices, triangles[hitInfo.triangleIndex], lastShadePos)) {
+			if (depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !lastSampledLights) {
 				float glow[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 				if (material.emissionTexture >= 0 && textures) {
 					SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
@@ -740,15 +735,17 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			// Direct light sampling with PBR BRDF
 			// ---------------------------------------------------------------
+			bool sampledLights = false;
 			{
 				int picks[PT_MAX_LIGHT_PICKS];
 				float pickWeights[PT_MAX_LIGHT_PICKS];
 				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
-					min(numLights, maxLightSamples), &rng, picks, pickWeights);
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
+				sampledLights = numPicks > 0;
 
 				for (int i = 0; i < numPicks; i++) {
 					float directLight[3], wi[3];
-					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin,
+					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
 						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
 					if (directLight[0] + directLight[1] + directLight[2] <= 0.0f) {
 						continue;
@@ -810,7 +807,7 @@ __global__ void PathTracingKernel(
 
 				if (indirectPdf > 1e-6f) {
 					float indirectLight[3];
-					SampleIndirectLight(hitInfo.position, surfaceNormal, indirectDir, shadeWorldTMin,
+					SampleIndirectLight(hitInfo.position, surfaceNormal, indirectDir, shadeWorldTMin, emissionBoost, sampledLights,
 						vertices, triangles, bvhNodes, triIndices, materials, textures,
 						lights, numLights, &rng, indirectLight);
 
@@ -931,9 +928,7 @@ __global__ void PathTracingKernel(
 				break;
 			}
 
-			lastShadePos[0] = hitInfo.position[0];
-			lastShadePos[1] = hitInfo.position[1];
-			lastShadePos[2] = hitInfo.position[2];
+			lastSampledLights = sampledLights;
 
 			// next ray from surface
 			ray.origin[0] = hitInfo.position[0] + surfaceNormal[0] * rayOffset;

@@ -66,6 +66,7 @@ option(TRACY		"Build and integrate the Tracy profiler, requires HARDLINK_GAME" O
 option(HARDLINK_GAME "Compile gamecode into executable (no game DLLs)" OFF)
 option(CUDA_PATHTRACER "Build with CUDA path tracer support" OFF)
 option(PT_MATERIAL_CACHE_TESTS "Build the path tracer material cache regression test" OFF)
+option(PT_CUDA_LIGHTING_TESTS "Build the CUDA path tracer lighting regression test" OFF)
 
 if(NOT MSVC) # GCC/clang or compatible, hopefully
 	option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored compiler warnings/errors (GCC/Clang only; esp. useful with ninja)." OFF)
@@ -1319,6 +1320,15 @@ if(PT_MATERIAL_CACHE_TESTS)
 	add_executable(pt_material_cache_test renderer_pt/tests/pt_material_cache_test.cpp)
 	target_link_libraries(pt_material_cache_test idlib)
 	add_test(pt_material_cache pt_material_cache_test)
+endif()
+if(PT_CUDA_LIGHTING_TESTS)
+	if(NOT HAVE_CUDA)
+		message(FATAL_ERROR "PT_CUDA_LIGHTING_TESTS requires CUDA_PATHTRACER and a CUDA compiler")
+	endif()
+	enable_testing()
+	add_executable(pt_cuda_lighting_test renderer_pt/tests/pt_cuda_lighting_test.cu)
+	add_test(pt_cuda_lighting pt_cuda_lighting_test)
+	set_tests_properties(pt_cuda_lighting PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 if(SDL3)
 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h

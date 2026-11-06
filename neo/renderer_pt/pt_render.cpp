@@ -102,6 +102,7 @@ typedef struct {
 	ptRenderParams_t		prevParams;
 	unsigned int			prevContentHash;
 	unsigned int			prevStructureHash;
+	float					prevLightScale;
 	bool					havePrev;
 
 	// display
@@ -421,7 +422,8 @@ static bool PT_ViewChanged( const ptRenderParams_t &a, const ptRenderParams_t &b
 		}
 	}
 	return idMath::Fabs( a.fovX - b.fovX ) > eps || idMath::Fabs( a.fovY - b.fovY ) > eps
-		|| a.width != b.width || a.height != b.height || a.renderMode != b.renderMode;
+		|| a.width != b.width || a.height != b.height || a.renderMode != b.renderMode
+		|| a.emissionBoost != b.emissionBoost;
 }
 
 /*
@@ -537,7 +539,9 @@ bool RB_PT_DrawView( void ) {
 	ptRenderParams_t params;
 	PT_SetupParams( params, viewDef, traceWidth, traceHeight );
 
-	bool reset = !r_ptAccumulation.GetBool() || !pt.havePrev || PT_ViewChanged( params, pt.prevParams );
+	const float lightScale = Max( 0.0f, r_lightScale.GetFloat() );
+	bool reset = !r_ptAccumulation.GetBool() || !pt.havePrev || PT_ViewChanged( params, pt.prevParams )
+		|| lightScale != pt.prevLightScale;
 	switch ( r_ptResetOnSceneChange.GetInteger() ) {
 		case 2:		reset |= pt.scene->ContentHash() != pt.prevContentHash;		// fall through
 		case 1:		reset |= pt.scene->StructureHash() != pt.prevStructureHash;	break;
@@ -549,6 +553,7 @@ bool RB_PT_DrawView( void ) {
 	pt.prevParams = params;
 	pt.prevContentHash = pt.scene->ContentHash();
 	pt.prevStructureHash = pt.scene->StructureHash();
+	pt.prevLightScale = lightScale;
 	pt.havePrev = true;
 
 	PT_ApplyProgressiveQuality( params, pt.backend->GetAccumulatedFrames() );

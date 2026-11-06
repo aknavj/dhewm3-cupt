@@ -66,6 +66,8 @@ idPathTracerScene::idPathTracerScene() {
 	contentHash = 0;
 	structureHash = 0;
 	frameCount = 0;
+	areaLightOverflow = 0;
+	warnedAreaLightBudget = false;
 	textureGeneration = 0;
 	needTextureFlush = false;
 	bounds[0] = bounds[1] = bounds[2] = bounds[3] = bounds[4] = bounds[5] = 0.0f;
@@ -92,6 +94,8 @@ void idPathTracerScene::Clear() {
 	lights.Clear();
 	areaLights.Clear();
 	areaLightTris.Clear();
+	areaLightOverflow = 0;
+	warnedAreaLightBudget = false;
 	FlushMaterialsAndTextures();
 }
 
@@ -145,6 +149,7 @@ void idPathTracerScene::BeginFrame() {
 	lights.SetNum( 0, false );
 	areaLights.SetNum( 0, false );
 	areaLightTris.SetNum( 0, false );
+	areaLightOverflow = 0;
 
 	if ( needTextureFlush ) {
 		common->Printf( "idPathTracerScene: flushing %d textures and %d materials (texture limit reached)\n",
@@ -238,8 +243,10 @@ void idPathTracerScene::AddTriangles( const idDrawVert *verts, int numVerts, con
 
 	const bool emissive = materialIndex != PT_DEFAULT_MATERIAL
 		&& !( triFlags & PT_TRI_WEAPON )
-		&& materials[materialIndex].blendMode == PT_BLEND_OPAQUE
-		&& !materials[materialIndex].isAmbientOnly
+		&& mat.blendMode == PT_BLEND_OPAQUE
+		&& !mat.isAmbientOnly
+		&& mat.transmission <= 0.0f
+		&& ( !mat.noShadows || mat.alphaTest > 0.0f )
 		&& ( materialEmission[materialIndex].x + materialEmission[materialIndex].y + materialEmission[materialIndex].z ) > PT_AREA_LIGHT_MIN_EMISSION;
 
 	PT_Reserve( triangles, triangles.Num() + numIndexes / 3 );
@@ -270,7 +277,7 @@ void idPathTracerScene::AddTriangles( const idDrawVert *verts, int numVerts, con
 		}
 		const int triIndex = triangles.Append( tri );
 
-		if ( emissive && AddEmissiveAreaLight( v0, v1, v2, materialIndex ) ) {
+		if ( emissive && AddEmissiveAreaLight( v0, v1, v2, materialIndex, triIndex ) ) {
 			triangles[triIndex].flags |= PT_TRI_AREA_LIGHT;
 			areaLightTris.Append( triIndex );
 		}
@@ -282,12 +289,8 @@ void idPathTracerScene::AddTriangles( const idDrawVert *verts, int numVerts, con
 idPathTracerScene::AddEmissiveAreaLight
 ========================
 */
-bool idPathTracerScene::AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2, int materialIndex ) {
-	// engine lights take priority, area lights are appended into what is left in EndFrame
-	if ( areaLights.Num() >= PT_MAX_LIGHTS ) {
-		return false;
-	}
-
+bool idPathTracerScene::AddEmissiveAreaLight( const ptVertex_t &v0, const ptVertex_t &v1, const ptVertex_t &v2,
+											  int materialIndex, int triangleIndex ) {
 	const idVec3 p0( v0.position[0], v0.position[1], v0.position[2] );
 	const idVec3 p1( v1.position[0], v1.position[1], v1.position[2] );
 	const idVec3 p2( v2.position[0], v2.position[1], v2.position[2] );
@@ -297,10 +300,13 @@ bool idPathTracerScene::AddEmissiveAreaLight( const ptVertex_t &v0, const ptVert
 	if ( area < 1e-4f ) {
 		return false;
 	}
+	// engine lights take priority, area lights are appended into what is left in EndFrame
+	if ( areaLights.Num() >= PT_LIGHT_BUDGET ) {
+		areaLightOverflow++;
+		return false;
+	}
 
 	const idVec3 &emission = materialEmission[materialIndex];
-	const float emissive = emission.x + emission.y + emission.z;
-
 	ptLight_t light;
 	memset( &light, 0, sizeof( light ) );
 	light.type = PT_LIGHT_AREA;
@@ -311,18 +317,15 @@ bool idPathTracerScene::AddEmissiveAreaLight( const ptVertex_t &v0, const ptVert
 	light.direction[1] = normal.y / ( area * 2.0f );
 	light.direction[2] = normal.z / ( area * 2.0f );
 
-	// clamped to avoid fireflies from tiny, very bright emitters
-	light.color[0] = idMath::ClampFloat( 0.0f, 1.0f, emission.x );
-	light.color[1] = idMath::ClampFloat( 0.0f, 1.0f, emission.y );
-	light.color[2] = idMath::ClampFloat( 0.0f, 1.0f, emission.z );
-	light.intensity = idMath::ClampFloat( 0.0f, 10.0f, emissive * idMath::Sqrt( area ) * 0.25f );
-	light.radius = idMath::Sqrt( area );
+	light.color[0] = emission.x;
+	light.color[1] = emission.y;
+	light.color[2] = emission.z;
 	light.area[0] = area;
-	light.textureIndex = materials[materialIndex].emissionTexture >= 0 ? materials[materialIndex].emissionTexture
-																	   : materials[materialIndex].albedoTexture;
+	light.areaBoundRadius = Max( ( p0 - center ).Length(), Max( ( p1 - center ).Length(), ( p2 - center ).Length() ) );
+	light.areaTriangleIndex = triangleIndex;
+	light.textureIndex = -1;
 	light.projectedTextureIndex = -1;
 	light.falloffTextureIndex = -1;
-	light.lightRadius3[0] = light.lightRadius3[1] = light.lightRadius3[2] = light.radius;
 
 	areaLights.Append( light );
 	return true;
@@ -350,46 +353,13 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 		return;
 	}
 
-	// like the GL interaction pass: the first enabled light stage gives the color
-	// (shaderParms and any time driven flicker) and the light image
-	const float *lightRegs = vLight->shaderRegisters;
-	const shaderStage_t *lightStage = NULL;
-	for ( int i = 0; i < lightShader->GetNumStages(); i++ ) {
-		const shaderStage_t *stage = lightShader->GetStage( i );
-		if ( stage && ( !lightRegs || lightRegs[stage->conditionRegister] != 0.0f ) ) {
-			lightStage = stage;
-			break;
-		}
-	}
-	if ( lightShader->GetNumStages() > 0 && !lightStage ) {
+	const float lightScale = Max( 0.0f, r_lightScale.GetFloat() );
+	if ( lightScale == 0.0f ) {
 		return;
 	}
 
-	idVec3 lightColor;
-	if ( lightStage && lightRegs ) {
-		for ( int c = 0; c < 3; c++ ) {
-			lightColor[c] = Max( 0.0f, lightRegs[lightStage->color.registers[c]] );
-		}
-		if ( lightColor.x + lightColor.y + lightColor.z < 0.003f ) {
-			return;
-		}
-	} else {
-		lightColor.Set( parms.shaderParms[SHADERPARM_RED], parms.shaderParms[SHADERPARM_GREEN], parms.shaderParms[SHADERPARM_BLUE] );
-		if ( lightColor.LengthSqr() < 0.01f ) {
-			lightColor.Set( 1.0f, 1.0f, 1.0f );
-		}
-	}
-	for ( int c = 0; c < 3; c++ ) {
-		lightColor[c] = PT_SrgbToLinear( lightColor[c] );
-	}
-
-	const int lightImageIndex = ( lightStage && lightStage->texture.image ) ? AddTexture( lightStage->texture.image ) : -1;
-	const int falloffImageIndex = lightShader->LightFalloffImage() ? AddTexture( lightShader->LightFalloffImage() ) : -1;
-
-	float baseIntensity = parms.shaderParms[SHADERPARM_ALPHA];
-	if ( baseIntensity < 0.01f ) {
-		baseIntensity = 1.0f;
-	}
+	const float *lightRegs = vLight->shaderRegisters;
+	const int falloffImageIndex = vLight->falloffImage ? AddTexture( vLight->falloffImage ) : -1;
 
 	float projPlanes[4][4];
 	for ( int p = 0; p < 4; p++ ) {
@@ -399,54 +369,97 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 		projPlanes[p][3] = vLight->lightProject[p][3];
 	}
 
-	if ( parms.pointLight ) {
-		const float radius = ( parms.lightRadius.x + parms.lightRadius.y + parms.lightRadius.z ) / 3.0f;
-		// compensate for the BRDF's 1/pi normalization
-		const float intensity = idMath::ClampFloat( 0.5f, 100.0f, baseIntensity * idMath::PI );
-
-		// origin + axis * lightCenter
-		const idVec3 &origin = lightDef->globalLightOrigin;
-
-		AddLight( origin, lightColor, intensity, PT_LIGHT_POINT, radius, &projPlanes[0][0], lightImageIndex, falloffImageIndex,
-			parms.lightRadius.ToFloatPtr() );
-	} else if ( parms.parallel ) {
-		idVec3 dir = parms.lightCenter;
-		if ( dir.LengthSqr() < 0.01f ) {
-			dir = parms.target - parms.origin;
+	const int stageCount = lightShader->GetNumStages();
+	for ( int i = 0; i < Max( stageCount, 1 ); i++ ) {
+		const shaderStage_t *stage = stageCount > 0 ? lightShader->GetStage( i ) : NULL;
+		if ( stageCount > 0 && !stage ) {
+			continue;
 		}
-		dir.Normalize();
+		if ( stage && lightRegs && lightRegs[stage->conditionRegister] == 0.0f ) {
+			continue;
+		}
 
-		AddLight( dir, lightColor, baseIntensity * 10.0f, PT_LIGHT_DIRECTIONAL, 0.0f, NULL, -1, -1, NULL );
-	} else {
-		const idVec3 worldTarget = parms.axis * parms.target;
-		const idVec3 worldRight = parms.axis * parms.right;
-		const idVec3 worldUp = parms.axis * parms.up;
-
-		idVec3 lightDir = worldTarget;
-		const float targetLen = lightDir.Length();
-		if ( targetLen > 0.01f ) {
-			lightDir /= targetLen;
+		idVec3 lightColor;
+		if ( stage && lightRegs ) {
+			for ( int c = 0; c < 3; c++ ) {
+				lightColor[c] = Max( 0.0f, lightRegs[stage->color.registers[c]] );
+			}
+			if ( lightColor.x + lightColor.y + lightColor.z <= 0.0f ) {
+				continue;
+			}
 		} else {
-			lightDir.Set( 1.0f, 0.0f, 0.0f );
+			lightColor.Set( parms.shaderParms[SHADERPARM_RED], parms.shaderParms[SHADERPARM_GREEN], parms.shaderParms[SHADERPARM_BLUE] );
+			if ( lightColor.LengthSqr() < 0.01f ) {
+				lightColor.Set( 1.0f, 1.0f, 1.0f );
+			}
+		}
+		for ( int c = 0; c < 3; c++ ) {
+			lightColor[c] = PT_SrgbToLinear( lightColor[c] * lightScale );
 		}
 
-		const float intensity = idMath::ClampFloat( 0.5f, 100.0f, baseIntensity * idMath::PI );
-		const float halfWidth = Max( worldRight.Length(), worldUp.Length() );
-		const float coneAngle = atanf( halfWidth / Max( targetLen, 1.0f ) );
-		const float coneFalloff = 2.0f;
-
-		float lightRange = ( parms.end - parms.start ).Length();
-		if ( lightRange < 10.0f ) {
-			lightRange = 500.0f;	// malformed frustum
+		const idImage *image = stage ? stage->texture.image : NULL;
+		const int lightImageIndex = image ? AddTexture( image ) : -1;
+		int textureAddress = PT_LIGHT_TEXTURE_REPEAT;
+		if ( image && image->repeat == TR_CLAMP_TO_BORDER ) {
+			textureAddress = PT_LIGHT_TEXTURE_BORDER;
+		} else if ( image && image->repeat != TR_REPEAT ) {
+			textureAddress = PT_LIGHT_TEXTURE_CLAMP;
+		}
+		float textureTransform[6] = { 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f };
+		if ( stage && lightRegs && stage->texture.hasMatrix ) {
+			float matrix[16];
+			RB_GetShaderTextureMatrix( lightRegs, &stage->texture, matrix );
+			textureTransform[0] = matrix[0];
+			textureTransform[1] = matrix[4];
+			textureTransform[2] = matrix[12];
+			textureTransform[3] = matrix[1];
+			textureTransform[4] = matrix[5];
+			textureTransform[5] = matrix[13];
 		}
 
-		idVec3 rightNorm = worldRight;
-		rightNorm.Normalize();
-		idVec3 upNorm = worldUp;
-		upNorm.Normalize();
+		// Stage RGB already contains any shader-parameter expressions; alpha is not RGB intensity.
+		if ( parms.pointLight ) {
+			const float radius = ( parms.lightRadius.x + parms.lightRadius.y + parms.lightRadius.z ) / 3.0f;
+			AddLight( lightDef->globalLightOrigin, lightColor, idMath::PI, PT_LIGHT_POINT, radius, &projPlanes[0][0],
+				lightImageIndex, falloffImageIndex, parms.lightRadius.ToFloatPtr(), textureTransform, textureAddress );
+		} else if ( parms.parallel ) {
+			idVec3 dir = parms.lightCenter;
+			if ( dir.LengthSqr() < 0.01f ) {
+				dir = parms.target - parms.origin;
+			}
+			dir.Normalize();
+			AddLight( dir, lightColor, 10.0f, PT_LIGHT_DIRECTIONAL, 0.0f, NULL, -1, -1, NULL, textureTransform, textureAddress );
+		} else {
+			const idVec3 worldTarget = parms.axis * parms.target;
+			const idVec3 worldRight = parms.axis * parms.right;
+			const idVec3 worldUp = parms.axis * parms.up;
 
-		AddSpotLight( parms.origin, lightDir, lightColor, intensity, coneAngle, coneFalloff, lightRange,
-			&projPlanes[0][0], lightImageIndex, falloffImageIndex, rightNorm.ToFloatPtr(), upNorm.ToFloatPtr() );
+			idVec3 lightDir = worldTarget;
+			const float targetLen = lightDir.Length();
+			if ( targetLen > 0.01f ) {
+				lightDir /= targetLen;
+			} else {
+				lightDir.Set( 1.0f, 0.0f, 0.0f );
+			}
+
+			const float halfWidth = Max( worldRight.Length(), worldUp.Length() );
+			const float coneAngle = atanf( halfWidth / Max( targetLen, 1.0f ) );
+			float lightRange = ( parms.end - parms.start ).Length();
+			if ( lightRange < 10.0f ) {
+				lightRange = 500.0f;
+			}
+			idVec3 rightNorm = worldRight;
+			rightNorm.Normalize();
+			idVec3 upNorm = worldUp;
+			upNorm.Normalize();
+
+			AddSpotLight( parms.origin, lightDir, lightColor, idMath::PI, coneAngle, 2.0f, lightRange,
+				&projPlanes[0][0], lightImageIndex, falloffImageIndex, rightNorm.ToFloatPtr(), upNorm.ToFloatPtr(),
+				textureTransform, textureAddress );
+		}
+		if ( !lightRegs ) {
+			break;
+		}
 	}
 }
 
@@ -459,14 +472,7 @@ For PT_LIGHT_DIRECTIONAL, position is the normalized light direction.
 */
 void idPathTracerScene::AddLight( const idVec3 &position, const idVec3 &color, float intensity, int type,
 								  float lightRadius, const float *lightProject, int projTexIndex, int falloffTexIndex,
-								  const float *lightRadiusXYZ ) {
-	if ( lights.Num() >= PT_MAX_LIGHTS ) {
-		if ( r_ptDebug.GetBool() ) {
-			common->Warning( "idPathTracerScene: light limit (%d) reached\n", PT_MAX_LIGHTS );
-		}
-		return;
-	}
-
+								  const float *lightRadiusXYZ, const float *textureTransform, int textureAddress ) {
 	ptLight_t light;
 	memset( &light, 0, sizeof( light ) );
 	light.type = type;
@@ -488,6 +494,8 @@ void idPathTracerScene::AddLight( const idVec3 &position, const idVec3 &color, f
 	light.textureIndex = -1;
 	light.projectedTextureIndex = projTexIndex;
 	light.falloffTextureIndex = falloffTexIndex;
+	memcpy( light.projectedTextureTransform, textureTransform, sizeof( light.projectedTextureTransform ) );
+	light.projectedTextureAddress = textureAddress;
 	light.boxFalloff = ( type != PT_LIGHT_DIRECTIONAL && lightProject ) ? 1 : 0;
 
 	for ( int i = 0; i < 3; i++ ) {
@@ -508,14 +516,8 @@ idPathTracerScene::AddSpotLight
 void idPathTracerScene::AddSpotLight( const idVec3 &position, const idVec3 &direction, const idVec3 &color,
 									  float intensity, float coneAngle, float coneFalloff, float lightRadius,
 									  const float *lightProject, int projTexIndex, int falloffTexIndex,
-									  const float *rightAxis, const float *upAxis ) {
-	if ( lights.Num() >= PT_MAX_LIGHTS ) {
-		if ( r_ptDebug.GetBool() ) {
-			common->Warning( "idPathTracerScene: light limit (%d) reached\n", PT_MAX_LIGHTS );
-		}
-		return;
-	}
-
+									  const float *rightAxis, const float *upAxis, const float *textureTransform,
+									  int textureAddress ) {
 	ptLight_t light;
 	memset( &light, 0, sizeof( light ) );
 	light.type = PT_LIGHT_POINT;
@@ -536,6 +538,8 @@ void idPathTracerScene::AddSpotLight( const idVec3 &position, const idVec3 &dire
 	light.coneFalloff = coneFalloff;
 	light.projectedTextureIndex = projTexIndex;
 	light.falloffTextureIndex = falloffTexIndex;
+	memcpy( light.projectedTextureTransform, textureTransform, sizeof( light.projectedTextureTransform ) );
+	light.projectedTextureAddress = textureAddress;
 	light.boxFalloff = lightProject ? 1 : 0;
 	light.lightRadius3[0] = light.lightRadius3[1] = light.lightRadius3[2] = lightRadius;
 
@@ -559,7 +563,7 @@ idPathTracerScene::EndFrame
 */
 void idPathTracerScene::EndFrame() {
 	// area lights fill whatever the engine lights left over
-	const int numArea = Min( areaLights.Num(), PT_MAX_LIGHTS - lights.Num() );
+	const int numArea = Min( areaLights.Num(), Max( PT_LIGHT_BUDGET - lights.Num(), 0 ) );
 	for ( int i = 0; i < numArea; i++ ) {
 		lights.Append( areaLights[i] );
 	}
@@ -567,8 +571,16 @@ void idPathTracerScene::EndFrame() {
 	for ( int i = numArea; i < areaLights.Num(); i++ ) {
 		triangles[areaLightTris[i]].flags &= ~PT_TRI_AREA_LIGHT;
 	}
-	if ( numArea < areaLights.Num() && r_ptDebug.GetBool() ) {
-		common->Printf( "idPathTracerScene: dropped %d emissive area lights (light limit)\n", areaLights.Num() - numArea );
+	const int omittedAreaLights = areaLightOverflow + areaLights.Num() - numArea;
+	if ( omittedAreaLights > 0 ) {
+		if ( !warnedAreaLightBudget ) {
+			common->Warning( "idPathTracerScene: %d emissive triangles exceed the light budget (%d); "
+				"they remain visible to bounce rays but are not directly sampled\n", omittedAreaLights, PT_LIGHT_BUDGET );
+			warnedAreaLightBudget = true;
+		}
+		if ( r_ptDebug.GetBool() ) {
+			common->Printf( "idPathTracerScene: %d emissive triangles not directly sampled (light budget)\n", omittedAreaLights );
+		}
 	}
 
 	bounds[0] = bounds[1] = bounds[2] = idMath::INFINITY;
