@@ -5,6 +5,7 @@
 #include "framework/Common.h"
 #include "framework/CmdSystem.h"
 #include "renderer/tr_local.h"
+#include "renderer_pt/pt_quality_preset.h"
 #include "renderer_pt/pt_render.h"
 #include "renderer_pt/pt_scene.h"
 
@@ -26,6 +27,15 @@ idCVar r_ptMode( "r_ptMode", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "
 idCVar r_ptDebug( "r_ptDebug", "0", CVAR_RENDERER | CVAR_BOOL, "print path tracer scene / timing info" );
 
 // quality
+static void PT_PresetCompletion( const idCmdArgs &args, void ( *callback )( const char * ) ) {
+	for ( int i = 0; i < PT_QUALITY_PRESET_COUNT; i++ ) {
+		callback( va( "%s %s", args.Argv( 0 ), ptQualityPresets[i].name ) );
+	}
+	callback( va( "%s custom", args.Argv( 0 ) ) );
+}
+
+idCVar r_ptPreset( "r_ptPreset", "med", CVAR_RENDERER | CVAR_ARCHIVE,
+	"path tracer quality preset: low, med, high, ultra, or custom", PT_PresetCompletion );
 idCVar r_ptRenderScale( "r_ptRenderScale", "0.5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "trace resolution relative to the viewport", 0.1f, 1.0f );
 idCVar r_ptSamplesPerPixel( "r_ptSamplesPerPixel", "4", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "samples per pixel per frame", 1, 64 );
 idCVar r_ptMaxDepth( "r_ptMaxDepth", "3", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "maximum ray bounces", 1, 16 );
@@ -113,6 +123,66 @@ typedef struct {
 } ptFrontEnd_t;
 
 static ptFrontEnd_t pt;
+
+static bool ptApplyingPreset = false;
+static const char *ptLastPresetName = "med";
+
+static void PT_PresetChanged( const idCVar &cvar ) {
+	if ( ptApplyingPreset ) {
+		return;
+	}
+	if ( idStr::Icmp( cvar.GetString(), "custom" ) == 0 ) {
+		ptLastPresetName = "custom";
+		return;
+	}
+	const ptQualityPreset_t *preset = PT_FindQualityPreset( cvar.GetString() );
+	if ( !preset ) {
+		common->Warning( "invalid r_ptPreset '%s'; use low, med, high, ultra, or custom", cvar.GetString() );
+		ptApplyingPreset = true;
+		r_ptPreset.SetString( ptLastPresetName );
+		ptApplyingPreset = false;
+		return;
+	}
+
+	ptLastPresetName = preset->name;
+	ptApplyingPreset = true;
+	r_ptRenderScale.SetFloat( preset->settings.renderScale );
+	r_ptSamplesPerPixel.SetInteger( preset->settings.samplesPerPixel );
+	r_ptMaxDepth.SetInteger( preset->settings.maxDepth );
+	r_ptMaxLightSamples.SetInteger( preset->settings.maxLightSamples );
+	ptApplyingPreset = false;
+}
+
+static void PT_QualityChanged( const idCVar & ) {
+	if ( ptApplyingPreset || idStr::Icmp( r_ptPreset.GetString(), "custom" ) == 0 ) {
+		return;
+	}
+	const ptQualityPreset_t *preset = PT_FindQualityPreset( r_ptPreset.GetString() );
+	if ( !preset ) {
+		common->Warning( "cannot update quality for invalid r_ptPreset '%s'", r_ptPreset.GetString() );
+		return;
+	}
+	const ptQualitySettings_t current = {
+		r_ptRenderScale.GetFloat(), r_ptSamplesPerPixel.GetInteger(),
+		r_ptMaxDepth.GetInteger(), r_ptMaxLightSamples.GetInteger()
+	};
+	if ( !PT_QualitySettingsEqual( current, preset->settings ) ) {
+		r_ptPreset.SetString( "custom" );
+	}
+}
+
+static void PT_InitQualityPresets() {
+	idCVar *qualityCVars[] = { &r_ptRenderScale, &r_ptSamplesPerPixel, &r_ptMaxDepth, &r_ptMaxLightSamples };
+	if ( !CVar_RegisterChangeCallback( r_ptPreset, PT_PresetChanged ) ) {
+		common->FatalError( "could not register r_ptPreset callback" );
+	}
+	for ( int i = 0; i < (int)( sizeof( qualityCVars ) / sizeof( qualityCVars[0] ) ); i++ ) {
+		if ( !CVar_RegisterChangeCallback( *qualityCVars[i], PT_QualityChanged ) ) {
+			common->FatalError( "could not register %s quality callback", qualityCVars[i]->GetName() );
+		}
+	}
+	PT_PresetChanged( r_ptPreset );
+}
 
 void RB_PT_InvalidateImages( void ) {
 	if ( pt.backend ) {
@@ -276,6 +346,7 @@ Called once from R_InitCommands, not on every vid_restart.
 ========================
 */
 void R_PT_InitCommands( void ) {
+	PT_InitQualityPresets();
 	cmdSystem->AddCommand( "r_ptInfo", PT_Info_f, CMD_FL_RENDERER, "prints path tracer backend information" );
 	cmdSystem->AddCommand( "r_ptReset", PT_Reset_f, CMD_FL_RENDERER, "restarts accumulation and drops cached materials / textures" );
 	cmdSystem->AddCommand( "r_ptCompare", R_PT_Compare_f, CMD_FL_RENDERER, "saves an OpenGL and a converged path traced screenshot of the current view" );
@@ -423,6 +494,8 @@ static bool PT_ViewChanged( const ptRenderParams_t &a, const ptRenderParams_t &b
 	}
 	return idMath::Fabs( a.fovX - b.fovX ) > eps || idMath::Fabs( a.fovY - b.fovY ) > eps
 		|| a.width != b.width || a.height != b.height || a.renderMode != b.renderMode
+		|| a.samplesPerPixel != b.samplesPerPixel || a.maxDepth != b.maxDepth
+		|| a.maxLightSamples != b.maxLightSamples
 		|| a.emissionBoost != b.emissionBoost;
 }
 

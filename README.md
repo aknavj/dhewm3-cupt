@@ -102,6 +102,10 @@ To run the material cache regression test, configure with `-DPT_MATERIAL_CACHE_T
 build the `pt_material_cache_test` target, then run `ctest -R pt_material_cache --output-on-failure`
 from the build directory. This test does not require CUDA.
 
+For the quality preset regression test, configure with `-DPT_QUALITY_PRESET_TESTS=ON`,
+build `pt_quality_preset_test`, and run `ctest -R pt_quality_preset --output-on-failure`.
+This test also works without CUDA.
+
 For the GPU lighting regression test, also configure with `-DPT_CUDA_LIGHTING_TESTS=ON`,
 build `pt_cuda_lighting_test`, and run `ctest -R pt_cuda_lighting --output-on-failure`.
 It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is available.
@@ -120,6 +124,25 @@ It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is
 The comparison and sequence targets count accumulated frames, not individual samples per pixel;
 the `_spp` suffix in screenshot filenames is historical.
 
+## Path Tracing Quality Presets
+
+Set `r_ptPreset low`, `med`, `high`, or `ultra` in the console. Presets update the following
+quality variables immediately; Medium matches the original defaults:
+
+| Preset | `r_ptRenderScale` | `r_ptSamplesPerPixel` | `r_ptMaxDepth` | `r_ptMaxLightSamples` |
+|--------|-------------------|-----------------------|----------------|-----------------------|
+| `low` | 0.35 | 1 | 2 | 1 |
+| `med` | 0.5 | 4 | 3 | 2 |
+| `high` | 0.75 | 6 | 4 | 3 |
+| `ultra` | 1.0 | 8 | 5 | 4 |
+
+Changing one of these variables manually switches `r_ptPreset` to `custom` and keeps the
+edited values. Selecting `custom` directly also leaves the current settings unchanged, and
+existing custom settings are preserved when upgrading. Presets do not change exposure, lighting
+colour, or other artistic controls. High and Ultra can be substantially slower; the progressive
+quality ramp still reduces samples and bounces for the first few frames after movement or a
+reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
+
 ## Console Variables
 
 | CVar | Default | Description |
@@ -128,6 +151,7 @@ the `_spp` suffix in screenshot filenames is historical.
 | `r_ptBackend` | `auto` | Compute backend: `auto`, `cuda` |
 | `r_ptMode` | `0` | Render mode, see above |
 | `r_ptDebug` | `0` | Print per-frame scene / timing info |
+| `r_ptPreset` | `med` | Apply a quality preset: `low`, `med`, `high`, `ultra`, or `custom` |
 | `r_ptRenderScale` | `0.5` | Trace resolution relative to the viewport (0.1–1.0) |
 | `r_ptSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
 | `r_ptMaxDepth` | `3` | Maximum ray bounces (1–16) |
