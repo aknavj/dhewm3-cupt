@@ -18,7 +18,6 @@
 */
 
 #define PT_MAX_TEXTURES			2048
-#define PT_MAX_MATERIALS		1024
 #define PT_MAX_LIGHTS			512
 #define PT_MAX_TEXTURE_SIZE		4096
 #define PT_MIN_RENDER_SIZE		64

@@ -3,6 +3,7 @@
 
 #include "idlib/containers/List.h"
 #include "idlib/containers/HashIndex.h"
+#include "renderer_pt/pt_material_cache.h"
 #include "renderer_pt/pt_types.h"
 
 class idMaterial;
@@ -49,11 +50,9 @@ typedef struct {
 	surfaces, materials, images and lights into the POD types of pt_types.h.
 
 	Geometry and lights are rebuilt every view. Materials and textures are cached
-	across views (keyed by engine pointer) until the texture budget overflows or
-	Clear() is called. Materials with entity or time driven registers get one
-	slot per distinct register set used in a frame, so entities sharing such a
-	material keep their own colors. Newly referenced textures are read back from OpenGL and
-	queued as pending uploads for the backend.
+	across views. Inactive material slots can be recycled, while every material
+	and register set used in the current frame keeps its own slot. Newly referenced
+	textures are read back from OpenGL and queued as pending uploads for the backend.
 
 ===============================================================================
 */
@@ -128,11 +127,7 @@ private:
 	// cached across views
 	idList<ptMaterial_t>	materials;
 	idList<idVec3>			materialEmission;
-	idList<const idMaterial *> materialPtrs;
-	idList<unsigned int>		materialNameHashes;
-	idList<int>				materialFrame;		// frame the material was last evaluated
-	idList<unsigned int>	materialRegHash;	// shader registers the slot was built with (animated materials)
-	idHashIndex				materialHash;
+	idPathTracerMaterialCache materialCache;
 
 	idList<ptTextureInfo_t>	textures;
 	idList<const idImage *>	texturePtrs;

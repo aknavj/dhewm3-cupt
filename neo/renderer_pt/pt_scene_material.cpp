@@ -37,8 +37,7 @@ static void PT_InitMaterial( ptMaterial_t &mat ) {
 ========================
 idPathTracerScene::AddDefaultMaterial
 
-Slot PT_DEFAULT_MATERIAL is reserved for surfaces without a material and for
-material table overflow, so those never alias a real material.
+Slot PT_DEFAULT_MATERIAL is reserved for surfaces without a material.
 ========================
 */
 void idPathTracerScene::AddDefaultMaterial() {
@@ -46,10 +45,6 @@ void idPathTracerScene::AddDefaultMaterial() {
     PT_InitMaterial( mat );
     materials.Append( mat );
     materialEmission.Append( vec3_origin );
-    materialPtrs.Append( NULL );
-    materialNameHashes.Append( 0 );
-    materialFrame.Append( -1 );
-    materialRegHash.Append( 0 );
 }
 
 /*
@@ -70,57 +65,23 @@ int idPathTracerScene::GetOrAddMaterial( const idMaterial *material, const float
     const unsigned int regHash = animated
         ? PT_HashWords( 2166136261u, shaderRegisters, material->GetNumRegisters() * sizeof( float ) ) : 0;
 
-    const int key = (int)(intptr_t)material;
-    const unsigned int nameHash = PT_HashString( material->GetName() );
-    int firstSlot = -1;
-    int freeSlot = -1;
-    for ( int i = materialHash.First( key ); i >= 0; i = materialHash.Next( i ) ) {
-        if ( materialPtrs[i] != material || materialNameHashes[i] != nameHash ) {
-            continue;
-        }
-        if ( !animated ) {
-            return i;
-        }
-        if ( firstSlot < 0 ) {
-            firstSlot = i;
-        }
-        if ( materialRegHash[i] == regHash ) {
-            materialFrame[i] = frameCount;
-            return i;
-        }
-        if ( freeSlot < 0 && materialFrame[i] != frameCount ) {
-            freeSlot = i;
-        }
+    bool rebuild;
+    const int index = materialCache.Acquire( material, PT_HashString( material->GetName() ),
+        animated, regHash, frameCount, rebuild );
+    if ( !rebuild ) {
+        return index;
     }
 
-    if ( freeSlot >= 0 ) {
-        BuildMaterial( materials[freeSlot], materialEmission[freeSlot], material, shaderRegisters );
-        materialFrame[freeSlot] = frameCount;
-        materialRegHash[freeSlot] = regHash;
-        return freeSlot;
+    if ( index < materials.Num() ) {
+        BuildMaterial( materials[index], materialEmission[index], material, shaderRegisters );
+    } else {
+        assert( index == materials.Num() );
+        ptMaterial_t mat;
+        idVec3 emission;
+        BuildMaterial( mat, emission, material, shaderRegisters );
+        materials.Append( mat );
+        materialEmission.Append( emission );
     }
-
-    if ( materials.Num() >= PT_MAX_MATERIALS ) {
-        if ( firstSlot >= 0 ) {
-            return firstSlot;	// share an instance rather than lose the material
-        }
-        common->Warning( "idPathTracerScene: material limit (%d) reached, '%s' uses the default material\n",
-            PT_MAX_MATERIALS, material->GetName() );
-        return PT_DEFAULT_MATERIAL;
-    }
-
-    const int index = materials.Num();
-    ptMaterial_t mat;
-    idVec3 emission;
-    BuildMaterial( mat, emission, material, shaderRegisters );
-
-    materials.Append( mat );
-    materialEmission.Append( emission );
-    materialPtrs.Append( material );
-    materialNameHashes.Append( nameHash );
-    materialFrame.Append( frameCount );
-    materialRegHash.Append( regHash );
-    materialHash.Add( key, index );
 
     if ( r_ptDebug.GetBool() ) {
         common->Printf( "idPathTracerScene: material %d: %s\n", index, material->GetName() );

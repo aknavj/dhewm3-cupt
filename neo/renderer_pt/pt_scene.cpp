@@ -111,11 +111,7 @@ void idPathTracerScene::FlushMaterialsAndTextures() {
 
 	materials.Clear();
 	materialEmission.Clear();
-	materialPtrs.Clear();
-	materialNameHashes.Clear();
-	materialFrame.Clear();
-	materialRegHash.Clear();
-	materialHash.Free();
+	materialCache.Clear();
 	AddDefaultMaterial();
 
 	textureGeneration++;
@@ -141,6 +137,7 @@ idPathTracerScene::BeginFrame
 */
 void idPathTracerScene::BeginFrame() {
 	frameCount++;
+	materialCache.BeginFrame();
 
 	// keep the allocations, the scene is rebuilt every view
 	vertices.SetNum( 0, false );

@@ -65,6 +65,7 @@ option(TRACY		"Build and integrate the Tracy profiler, requires HARDLINK_GAME" O
 
 option(HARDLINK_GAME "Compile gamecode into executable (no game DLLs)" OFF)
 option(CUDA_PATHTRACER "Build with CUDA path tracer support" OFF)
+option(PT_MATERIAL_CACHE_TESTS "Build the path tracer material cache regression test" OFF)
 
 if(NOT MSVC) # GCC/clang or compatible, hopefully
 	option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored compiler warnings/errors (GCC/Clang only; esp. useful with ninja)." OFF)
@@ -1313,6 +1314,12 @@ include_directories(${CMAKE_BINARY_DIR})
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(idlib STATIC ${src_idlib})
+if(PT_MATERIAL_CACHE_TESTS)
+	enable_testing()
+	add_executable(pt_material_cache_test renderer_pt/tests/pt_material_cache_test.cpp)
+	target_link_libraries(pt_material_cache_test idlib)
+	add_test(pt_material_cache pt_material_cache_test)
+endif()
 if(SDL3)
 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
 endif()

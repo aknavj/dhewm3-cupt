@@ -53,7 +53,8 @@ and all GUI drawing on top of the 3D view.
   and a CUB radix sort, ordered on a single CUDA stream with no device-wide syncs
 - **PBR materials** extracted from Doom 3 shader stages: albedo, normal map, specular,
   alpha test, blend modes, vertex colours, emission, glass (Fresnel + IOR). Time-varying shader
-  registers are re-evaluated every frame, per entity
+  registers are re-evaluated every frame, per entity. Inactive material slots are reused,
+  and the cache grows when a view needs more simultaneously
 - **Stochastic direct lighting** with soft shadows, matching the GL light model: projected light
   image times falloff image, stage colours and condition registers, lights picked by estimated
   contribution. Shadow rays pass through alpha tested and translucent surfaces
@@ -88,6 +89,10 @@ CUDAFLAGS="-allow-unsupported-compiler -std=c++17" cmake -DCUDA_PATHTRACER=ON ..
 ```
 
 Without `CUDA_PATHTRACER` the engine builds and runs as plain dhewm3, with no path tracer code compiled in.
+
+To run the material cache regression test, configure with `-DPT_MATERIAL_CACHE_TESTS=ON`,
+build the `pt_material_cache_test` target, then run `ctest -R pt_material_cache --output-on-failure`
+from the build directory. This test does not require CUDA.
 
 ## Console Commands
 
