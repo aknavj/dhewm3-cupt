@@ -1,91 +1,189 @@
-# DOOM3 CUDA PATH TRACING RENDERER
+# DOOM3 GPU PATH TRACING RENDERER
 
-This fork adds an experimental **GPU path tracing renderer** (`neo/renderer_cuda/`) built with
-NVIDIA CUDA that can replace the classic OpenGL rasterizer. It is gated behind the
+This fork adds an experimental **GPU path tracer** (`neo/renderer_pt/`) that can replace the
+classic OpenGL rasterizer for 3D views. The front end is compute-API agnostic; the only
+backend implemented today is **CUDA** (`neo/renderer_pt/cuda/`). It is gated behind the
 `CUDA_PATHTRACER` CMake option (off by default).
 
 ## Overview
 
-The renderer extracts the full scene (geometry, materials, lights) from dhewm3's existing
-draw-call pipeline each frame, uploads it to the GPU, builds a BVH, and path traces the
-image — blitting the final pixels back to OpenGL via `glDrawPixels`.
+Each frame the front end walks the view's draw surfaces and lights, builds a flat scene
+(vertices, triangles, materials, lights, textures) on the CPU and hands it to the active
+backend. The backend uploads it, builds a BVH on the GPU, path traces and tone maps the
+image, and the front end stretches the result over the view's viewport. 2D views and
+subviews (mirrors, remote cameras, portal skies) are still drawn with OpenGL, as is the HUD
+and all GUI drawing on top of the 3D view.
 
-## Rendering Modes
+## Source Layout
 
-| CVar Value | Mode |
-|------------|------|
-| 0 | **Full PBR path tracing** — Monte Carlo with Cook-Torrance BRDF, progressive accumulation |
-| 1 | BVH debug — ray cast with random per-triangle coloring |
-| 2–6 | Texture debug — visualise albedo, base color, normal map, specular map |
-| 7 | **Whitted-style ray tracing** — direct lighting, Blinn-Phong specular, mirror reflections |
+| Path | Contents |
+|------|----------|
+| `renderer_pt/pt_types.h` | POD types shared by host and device: `ptVertex_t`, `ptTriangle_t`, `ptMaterial_t`, `ptLight_t`, `ptBVHNode_t`, `ptRenderParams_t`, limits and enums |
+| `renderer_pt/pt_backend.h` | `idPathTracerBackend` – abstract compute backend interface and factory type |
+| `renderer_pt/pt_scene.h/.cpp`, `pt_scene_material.cpp` | `idPathTracerScene` – API-agnostic scene builder (geometry, Doom 3 material → PBR conversion, lights, texture readback, change hashes) |
+| `renderer_pt/pt_render.h/.cpp` | Front end: cvars, backend registry / lifecycle, accumulation control, viewport blit (`RB_PT_*`) |
+| `renderer_pt/pt_commands.cpp` | `r_ptCompare`, `r_ptSequence`, `r_ptAbort` capture tools |
+| `renderer_pt/cuda/` | CUDA backend (`idPathTracerBackendCUDA`), kernels and the GPU LBVH builder |
+
+## Adding a Backend (e.g. OpenCL)
+
+1. Implement `idPathTracerBackend` (see `pt_backend.h`) in `neo/renderer_pt/<api>/`.
+   The contract:
+   - `Init` / `Resize` allocate the output for the maximum (window) size. `Render` may be called with any smaller trace size.
+   - `UploadScene` receives an `idPathTracerScene`. Upload `PendingTextures()` into the slots given by their `index`. When `TextureGeneration()` changes, drop all cached textures.
+   - `Render` accumulates samples into a float buffer until `ResetAccumulation()` is called, then tone maps it to RGBA8. Only `PT_MODE_PATHTRACE` accumulates; debug modes overwrite.
+   - Report unrecoverable device errors through `IsHealthy()`, and the front end falls back to OpenGL.
+   - All data types in `pt_types.h` are plain structs with no API-specific members, so they can be copied to the device as-is.
+2. Export `PT_<API>_IsAvailable()` and `PT_<API>_CreateBackend()`, and add them to `ptBackendFactories[]` in `pt_render.cpp`.
+3. In `neo/CMakeLists.txt`, add a detection block that defines `HAVE_PATHTRACER` and `HAVE_<API>`. Append your host sources to `src_renderer` and any device sources to `src_renderer_pt_device`.
+4. Select it with `r_ptBackend <name>`. `auto` picks the first available backend.
+
+## Rendering Modes (`r_ptMode`)
+
+| Value | Mode |
+|-------|------|
+| 0 | **Path tracing** – Monte Carlo with Cook-Torrance BRDF, progressive accumulation |
+| 1 | BVH debug – primary rays with random per-triangle colours |
+| 2–6 | Texture debug – combined, base colour, albedo, normal map, specular map |
+| 7 | **Whitted-style ray tracing** – direct lighting, Blinn-Phong specular, mirror reflections |
 
 ## Key Features
 
-- **Linear BVH (LBVH)** built entirely on the GPU each frame using the Karras algorithm
-  and Thrust radix sort
-- **PBR materials** extracted from Doom 3 shader stages — albedo, normal map, specular,
-  alpha test, blend modes, vertex colors, emission, transmission/glass (Fresnel + IOR)
-- **Stochastic direct lighting** with soft shadows, projected textures, and spotlight falloff
-- **One-bounce indirect lighting** (global illumination) via cosine-weighted hemisphere sampling
-- **Volumetric scattering** with ray-marched Henyey-Greenstein phase function
-- **Progressive temporal accumulation** with automatic reset on camera movement and quality
-  ramp-up over successive frames
-- **Tone mapping** — selectable Reinhard / ACES / Uncharted 2 with configurable exposure and gamma
-- **Configurable render scale** (0.25×–1.0×) for performance tuning
-- **~50 CVars** controlling SPP, bounce depth, Russian roulette, firefly clamping, sky colour,
-  fog density, and more
-- **Comparison / sequence tools** for capturing side-by-side GL vs. path-traced screenshots
+- **Linear BVH (LBVH)** built entirely on the GPU every frame using the Karras algorithm
+  and a CUB radix sort, ordered on a single CUDA stream with no device-wide syncs
+- **PBR materials** extracted from Doom 3 shader stages: albedo, normal map, specular,
+  alpha test, blend modes, vertex colours, emission, glass (Fresnel + IOR). Time-varying shader
+  registers are re-evaluated every frame, per entity. Inactive material slots are reused,
+  and the cache grows when a view needs more simultaneously
+- **Stochastic direct lighting** with soft shadows: every enabled light stage, its projected
+  image and texture matrix, the engine-resolved falloff image, and `r_lightScale` contribute to
+  the lighting. Shadow rays pass through alpha tested and translucent surfaces
+- **sRGB correct shading**: textures and colours are decoded to linear before lighting
+- **First person weapon** rendered as an overlay that never gets clipped by nearby walls
+- **Indirect lighting** via cosine-weighted hemisphere sampling, plus textured emissive triangles
+  sampled as area lights with geometric falloff and visibility
+- **Volumetric scattering** with a ray-marched Henyey-Greenstein phase function
+- **Progressive accumulation** that resets on camera, mode, resolution or (configurable) scene
+  changes, uses a running mean to preserve precision, and ramps quality over the first frames
+- **Stackless BVH traversal** with escape links, so deep LBVH trees cannot overflow a per-ray stack
+- **Cache invalidation** after `reloadImages`, plus identity checks to avoid stale cache hits when
+  engine pointers are reused
+- **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
+- **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
+
+Generated area lights share a target budget of 512 lights with engine light stages. Engine
+light stages take priority and can grow beyond that budget; any emissive triangles that do
+not fit still contribute when hit by a bounce ray, and the renderer warns once when the budget
+is exceeded. Eligible opaque emitters are sampled on both sides,
+including their glow texture and alpha test. Transmissive emitters and no-shadow decal overlays
+are not sampled as area lights. The Whitted debug mode currently omits generated area lights.
 
 ## Building with CUDA
 
-Requires the NVIDIA CUDA Toolkit. Enable the option when running CMake:
+Requires the NVIDIA CUDA Toolkit and a host compiler it supports.
 
 ```
 cmake -DCUDA_PATHTRACER=ON /path/to/repository/neo
 ```
 
-The build targets SM 75 through SM 90 (Turing → Hopper). `.cu` files are compiled
-with NVCC; all other sources are compiled normally with the host C++ compiler.
+By default, kernels are built for SM 75–90 (Turing → Hopper). Override this with
+`-DCMAKE_CUDA_ARCHITECTURES=<list>`, for example `75` for a faster single-GPU build.
+
+If your distribution's GCC is newer than nvcc supports (for example, GCC 16 with CUDA 13.1),
+point nvcc at an older host compiler with `-DCMAKE_CUDA_HOST_COMPILER=g++-15`, or try:
+
+```
+CUDAFLAGS="-allow-unsupported-compiler -std=c++17" cmake -DCUDA_PATHTRACER=ON ...
+```
+
+Without `CUDA_PATHTRACER` the engine builds and runs as plain dhewm3, with no path tracer code compiled in.
+
+To run the material cache regression test, configure with `-DPT_MATERIAL_CACHE_TESTS=ON`,
+build the `pt_material_cache_test` target, then run `ctest -R pt_material_cache --output-on-failure`
+from the build directory. This test does not require CUDA.
+
+For the quality preset regression test, configure with `-DPT_QUALITY_PRESET_TESTS=ON`,
+build `pt_quality_preset_test`, and run `ctest -R pt_quality_preset --output-on-failure`.
+This test also works without CUDA.
+
+For the GPU lighting regression test, also configure with `-DPT_CUDA_LIGHTING_TESTS=ON`,
+build `pt_cuda_lighting_test`, and run `ctest -R pt_cuda_lighting --output-on-failure`.
+It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is available.
+
+## Console Commands
+
+| Command | Description |
+|---------|-------------|
+| `r_ptInfo` | List compiled backends and print device / memory / timing info for the active one |
+| `r_ptReset` | Restart accumulation and drop cached materials and textures |
+| `r_ptCompare [frames]` | Save an OpenGL and a path-traced screenshot after the given accumulated frame count |
+| `r_ptSequence <start> <end> [frames]` | Path trace a range of demo frames to screenshots |
+| `r_ptAbort` | Abort `r_ptCompare` / `r_ptSequence` |
+| `r_glSequence` / `r_glAbort` | OpenGL counterpart of `r_ptSequence` (always available) |
+
+The comparison and sequence targets count accumulated frames, not individual samples per pixel;
+the `_spp` suffix in screenshot filenames is historical.
+
+## Path Tracing Quality Presets
+
+Set `r_ptPreset low`, `med`, `high`, or `ultra` in the console. Presets update the following
+quality variables immediately; Medium matches the original defaults:
+
+| Preset | `r_ptRenderScale` | `r_ptSamplesPerPixel` | `r_ptMaxDepth` | `r_ptMaxLightSamples` |
+|--------|-------------------|-----------------------|----------------|-----------------------|
+| `low` | 0.35 | 1 | 2 | 1 |
+| `med` | 0.5 | 4 | 3 | 2 |
+| `high` | 0.75 | 6 | 4 | 3 |
+| `ultra` | 1.0 | 8 | 5 | 4 |
+
+Changing one of these variables manually switches `r_ptPreset` to `custom` and keeps the
+edited values. Selecting `custom` directly also leaves the current settings unchanged, and
+existing custom settings are preserved when upgrading. Presets do not change exposure, lighting
+colour, or other artistic controls. High and Ultra can be substantially slower; the progressive
+quality ramp still reduces samples and bounces for the first few frames after movement or a
+reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
 
 ## Console Variables
 
-All CVars use the `r_cu` prefix and can be set from the Doom 3 console or config files.
-
 | CVar | Default | Description |
 |------|---------|-------------|
-| `r_cuRenderer` | `1` | Enable the CUDA renderer |
-| `r_cuRendererMode` | `0` | Render mode: 0 = path tracing, 1 = BVH debug, 2 = textured combined, 3 = base color, 4 = albedo texture, 5 = normal texture, 6 = specular texture, 7 = Whitted ray tracing |
-| `r_cuDebug` | `0` | Show CUDA renderer debug info |
-| `r_cuRenderScale` | `0.5` | Render resolution scale (0.25–1.0, lower = faster) |
-| `r_cuSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
-| `r_cuMaxBounces` | `3` | Maximum ray bounces (1–16) |
-| `r_cuDirectSamples` | `2` | Direct light samples per hit (1–8) |
-| `r_cuIndirectProbability` | `0.15` | Indirect lighting probability (0.0–1.0) |
-| `r_cuRussianRoulette` | `1` | Enable Russian roulette path termination |
-| `r_cuRRMinBounces` | `2` | Minimum bounces before Russian roulette kicks in (1–8) |
-| `r_cuRRMinSurvival` | `0.1` | Minimum survival probability (0.05–0.5) |
-| `r_cuRRThreshold` | `0.05` | Throughput threshold for early termination (0.0–0.5) |
-| `r_cuFireflyClamp` | `5.0` | Clamp max sample brightness (0 = off) |
-| `r_cuEarlyTermination` | `0.25` | Early path termination on low throughput (0.0–1.0) |
-| `r_cuAccumulation` | `1` | Temporal accumulation (0 = off, 1 = on) |
-| `r_cuRayOffset` | `0.001` | Ray origin offset to prevent self-intersection |
-| `r_cuEmissionScale` | `1.0` | Emission multiplier (0.1–10.0) |
-| `r_cuSpecularScale` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
-| `r_cuSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard, 0.05 = subtle, 0.2 = soft) |
-| `r_cuExposure` | `1.0` | Exposure multiplier (0.1–10.0) |
-| `r_cuGamma` | `2.2` | Gamma correction (1.8–2.6) |
-| `r_cuToneMap` | `1` | Tone mapper: 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |
-| `r_cuSkyIntensity` | `0.0` | Sky dome ambient intensity (0.0–2.0) |
-| `r_cuSkyZenithR/G/B` | `0.3 / 0.35 / 0.5` | Sky zenith colour |
-| `r_cuSkyHorizonR/G/B` | `0.4 / 0.35 / 0.3` | Sky horizon colour |
-| `r_cuSkyGroundR/G/B` | `0.1 / 0.08 / 0.05` | Sky ground colour |
-| `r_cuVolumetricIntensity` | `0.0` | Volumetric scattering intensity (0 = off, expensive) |
-| `r_cuVolumetricDensity` | `0.008` | Fog density (0.001–0.1) |
-| `r_cuVolumetricSteps` | `16` | Ray-march steps (4–64) |
-| `r_cuVolumetricAnisotropy` | `0.6` | Scattering anisotropy, Henyey-Greenstein g (−1 to 1) |
-| `r_cuVolumetricFalloff` | `2.0` | Distance falloff exponent |
-| `r_cuVolumetricMaxDist` | `500.0` | Maximum sampling distance |
+| `r_ptDraw` | `1` | Draw 3D views with the path tracer (0 = OpenGL) |
+| `r_ptBackend` | `auto` | Compute backend: `auto`, `cuda` |
+| `r_ptMode` | `0` | Render mode, see above |
+| `r_ptDebug` | `0` | Print per-frame scene / timing info |
+| `r_ptPreset` | `med` | Apply a quality preset: `low`, `med`, `high`, `ultra`, or `custom` |
+| `r_ptRenderScale` | `0.5` | Trace resolution relative to the viewport (0.1–1.0) |
+| `r_ptSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
+| `r_ptMaxDepth` | `3` | Maximum ray bounces (1–16) |
+| `r_ptMaxLightSamples` | `2` | Lights sampled per hit, picked by estimated contribution (1–8) |
+| `r_ptIndirectProb` | `0.15` | Probability of the one bounce GI estimate, only used when `r_ptMaxDepth` is 1 (0–1) |
+| `r_ptRussianRoulette` | `1` | Russian roulette path termination |
+| `r_ptRRMinBounces` | `2` | Bounces before Russian roulette starts (0–16) |
+| `r_ptRRSurvivalMin` | `0.1` | Minimum survival probability (0.01–0.95) |
+| `r_ptEarlyTermThreshold` | `0.05` | Russian roulette for paths below this throughput after a bounce (0–0.5, unbiased) |
+| `r_ptThroughputClamp` | `0.25` | Russian roulette for paths below this throughput after shading (0–1, unbiased) |
+| `r_ptFireflyClamp` | `5.0` | Clamp per-sample radiance (0 = off) |
+| `r_ptAccumulation` | `1` | Accumulate samples while the view is static |
+| `r_ptResetOnSceneChange` | `1` | Restart accumulation on scene changes: 0 = camera only, 1 = objects/lights appearing or vanishing, 2 = any change incl. animation (may never converge) |
+| `r_ptRayOffset` | `0.001` | Ray origin offset against self-intersection |
+| `r_ptEmissionBoost` | `1.0` | Emission multiplier |
+| `r_ptSpecularBoost` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
+| `r_ptSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard shadows) |
+| `r_ptExposure` | `1.0` | Exposure multiplier |
+| `r_ptGamma` | `2.2` | Output gamma, textures and colors are decoded with 2.2 |
+| `r_ptToneMapMode` | `1` | 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |
+| `r_ptSkyIntensity` | `0.0` | Sky dome intensity for primary ray misses |
+| `r_ptSkyColorZenithR/G/B` | `0.3 / 0.35 / 0.5` | Sky zenith colour |
+| `r_ptSkyColorHorizonR/G/B` | `0.4 / 0.35 / 0.3` | Sky horizon colour |
+| `r_ptSkyColorGroundR/G/B` | `0.1 / 0.08 / 0.05` | Sky ground colour |
+| `r_ptVolumetric` | `0.0` | Volumetric scattering intensity (0 = off, expensive) |
+| `r_ptVolumetricDensity` | `0.008` | Fog density |
+| `r_ptVolumetricSteps` | `16` | Ray-march steps (1–128) |
+| `r_ptVolumetricAnisotropy` | `0.6` | Henyey-Greenstein g (−1 to 1) |
+| `r_ptVolFalloff` | `2.0` | Distance falloff exponent |
+| `r_ptVolMaxDist` | `500.0` | Maximum sampling distance |
 
+The old `r_cu*` cvars have been renamed to `r_pt*`. Old config entries are ignored.
 
 # ABOUT
 

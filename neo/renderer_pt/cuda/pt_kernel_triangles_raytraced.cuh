@@ -3,11 +3,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <device_launch_parameters.h>
-#include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
-#include "renderer_cuda/cu_renderer_material.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_material.cuh"
 
 /*
 ========================
@@ -19,24 +18,20 @@ __device__ __forceinline__ bool TraceShadowRay_RT(
 	float oX, float oY, float oZ,
 	float dX, float dY, float dZ,
 	float maxDist,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
 	const int* triIndices,
-	const cudaBVHNode_t* bvhNodes
+	const ptBVHNode_t* bvhNodes
 ) {
 	float idX = 1.0f / (fabsf(dX) > 1e-8f ? dX : copysignf(1e-8f, dX));
 	float idY = 1.0f / (fabsf(dY) > 1e-8f ? dY : copysignf(1e-8f, dY));
 	float idZ = 1.0f / (fabsf(dZ) > 1e-8f ? dZ : copysignf(1e-8f, dZ));
 
-	int stack[64];
-	int sp = 0;
-	stack[sp++] = 0;
-
-	while (sp > 0) {
-		int ni = stack[--sp];
-		const cudaBVHNode_t& nd = bvhNodes[ni];
+	for (int ni = 0; ni >= 0; ) {
+		const ptBVHNode_t& nd = bvhNodes[ni];
 
 		if (!IntersectAABB_Simple(oX, oY, oZ, idX, idY, idZ, nd.bounds, maxDist)) {
+			ni = nd.escapeIndex;
 			continue;
 		}
 
@@ -50,9 +45,9 @@ __device__ __forceinline__ bool TraceShadowRay_RT(
 					return true;
 				}
 			}
+			ni = nd.escapeIndex;
 		} else {
-			if (nd.leftChild >= 0 && sp < 63) stack[sp++] = nd.leftChild;
-			if (nd.rightChild >= 0 && sp < 63) stack[sp++] = nd.rightChild;
+			ni = nd.leftChild;
 		}
 	}
 	return false;
@@ -67,10 +62,10 @@ BVH closest-hit traversal with barycentric output
 __device__ __forceinline__ float TraceRay_RT(
 	float oX, float oY, float oZ,
 	float dX, float dY, float dZ,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
 	const int* triIndices,
-	const cudaBVHNode_t* bvhNodes,
+	const ptBVHNode_t* bvhNodes,
 	int& outTriIdx,
 	float& outU,
 	float& outV
@@ -82,15 +77,11 @@ __device__ __forceinline__ float TraceRay_RT(
 	float nearest = 1e30f;
 	outTriIdx = -1;
 
-	int stack[64];
-	int sp = 0;
-	stack[sp++] = 0;
-
-	while (sp > 0) {
-		int ni = stack[--sp];
-		const cudaBVHNode_t& nd = bvhNodes[ni];
+	for (int ni = 0; ni >= 0; ) {
+		const ptBVHNode_t& nd = bvhNodes[ni];
 
 		if (!IntersectAABB_Simple(oX, oY, oZ, idX, idY, idZ, nd.bounds, nearest)) {
+			ni = nd.escapeIndex;
 			continue;
 		}
 
@@ -108,9 +99,9 @@ __device__ __forceinline__ float TraceRay_RT(
 					outV = bv;
 				}
 			}
+			ni = nd.escapeIndex;
 		} else {
-			if (nd.leftChild >= 0 && sp < 63) stack[sp++] = nd.leftChild;
-			if (nd.rightChild >= 0 && sp < 63) stack[sp++] = nd.rightChild;
+			ni = nd.leftChild;
 		}
 	}
 	return nearest;
@@ -121,48 +112,19 @@ __device__ __forceinline__ float TraceRay_RT(
 TriangleDrawRayTracedKernel
 ========================
 */
-__global__ __forceinline__ void TriangleDrawRayTracedKernel(
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+__global__ void TriangleDrawRayTracedKernel(
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	int width,
-	int height,
-	const float* cameraPos,
-	const float* cameraForward,
-	const float* cameraRight,
-	const float* cameraUp,
-	float fov,
-	float fovY,
-	int samplesPerPixel,
-	int maxDepth,
-	int maxLightSamples,
-	int frameIndex,
-	float emissionBoost,
-	float indirectProb,
-	int rrEnabled,
-	int rrMinBounces,
-	float rrSurvivalMin,
-	float earlyTermThreshold,
-	float fireflyClamp,
-	float throughputClamp,
-	float rayOffset,
-	float specularBoost,
-	float skyIntensity,
-	const float* skyColorZenith,
-	const float* skyColorHorizon,
-	const float* skyColorGround,
-	float volumetricDensity,
-	int volumetricSteps,
-	float volumetricAnisotropy,
-	float volFalloff,
-	float volMaxDist
+	const ptRenderParams_t params
 ) {
+	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -233,7 +195,7 @@ __global__ __forceinline__ void TriangleDrawRayTracedKernel(
 			break;
 		}
 
-		const cudaTriangle_t& tri = triangles[hitIdx];
+		const ptTriangle_t& tri = triangles[hitIdx];
 		int i0 = tri.vertexIndices[0];
 		int i1 = tri.vertexIndices[1];
 		int i2 = tri.vertexIndices[2];
@@ -261,7 +223,7 @@ __global__ __forceinline__ void TriangleDrawRayTracedKernel(
 		float pZ = rayOrigZ + rayDirZ * hitT;
 
 		// material lookup
-		const cudaMaterial_t& mat = materials[tri.materialIndex];
+		const ptMaterial_t& mat = materials[tri.materialIndex];
 		float albR = mat.albedo[0];
 		float albG = mat.albedo[1];
 		float albB = mat.albedo[2];
@@ -416,7 +378,10 @@ __global__ __forceinline__ void TriangleDrawRayTracedKernel(
 		float specR = 0.0f, specG = 0.0f, specB = 0.0f;
 
 		for (int li = 0; li < numLights; li++) {
-			const cudaLight_t& light = lights[li];
+			const ptLight_t& light = lights[li];
+			if (light.type == PT_LIGHT_AREA) {
+				continue;  // area-light sampling is implemented in path-tracing mode
+			}
 
 			float lX, lY, lZ;
 			float shadowDist;

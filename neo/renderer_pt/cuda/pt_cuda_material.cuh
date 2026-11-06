@@ -3,8 +3,8 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
 
 /*
 =================================================================================
@@ -24,12 +24,13 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 	u = u - floorf(u);
 	v = v - floorf(v);
 
-	// convert to texel coordinates
-	float x = u * (float)tex.width;
-	float y = v * (float)tex.height;
-
-	int x0 = (int)x % tex.width;
-	int y0 = (int)y % tex.height;
+	// Normalized GL sampling places texel centers at (i + 0.5) / size.
+	float x = u * (float)tex.width - 0.5f;
+	float y = v * (float)tex.height - 0.5f;
+	const int ix = (int)floorf(x);
+	const int iy = (int)floorf(y);
+	int x0 = (ix % tex.width + tex.width) % tex.width;
+	int y0 = (iy % tex.height + tex.height) % tex.height;
 	int x1 = (x0 + 1) % tex.width;
 	int y1 = (y0 + 1) % tex.height;
 
@@ -47,6 +48,57 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 		float v1 = tex.data[idx01 + c] * (1.0f - fx) + tex.data[idx11 + c] * fx;
 		color[c] = (v0 * (1.0f - fy) + v1 * fy) / 255.0f;
 	}
+}
+
+// SampleTexture with the color channels decoded from sRGB (albedo, glow and light images)
+__device__ inline void SampleTextureSrgb(const cudaTexture_t* textures, int texIndex, float u, float v, float* color) {
+	SampleTexture(textures, texIndex, u, v, color);
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
+}
+
+__device__ inline void SampleLightTextureSrgb(const cudaTexture_t* textures, int texIndex,
+	float u, float v, int address, float* color) {
+	if (texIndex < 0 || texIndex >= MAX_TEXTURES || !textures[texIndex].data
+		|| textures[texIndex].width <= 0 || textures[texIndex].height <= 0) {
+		color[0] = color[1] = color[2] = color[3] = 1.0f;
+		return;
+	}
+
+	const cudaTexture_t& tex = textures[texIndex];
+	if (address == PT_LIGHT_TEXTURE_CLAMP) {
+		const float halfU = 0.5f / (float)tex.width;
+		const float halfV = 0.5f / (float)tex.height;
+		u = fminf(fmaxf(u, halfU), 1.0f - halfU);
+		v = fminf(fmaxf(v, halfV), 1.0f - halfV);
+		SampleTexture(textures, texIndex, u, v, color);
+	} else if (address == PT_LIGHT_TEXTURE_BORDER) {
+		const float x = u * (float)tex.width - 0.5f;
+		const float y = v * (float)tex.height - 0.5f;
+		color[0] = color[1] = color[2] = color[3] = 0.0f;
+		if (x > -1.0f && x < (float)tex.width && y > -1.0f && y < (float)tex.height) {
+			const int x0 = (int)floorf(x);
+			const int y0 = (int)floorf(y);
+			const float fx = x - (float)x0;
+			const float fy = y - (float)y0;
+			for (int dy = 0; dy < 2; dy++) {
+				for (int dx = 0; dx < 2; dx++) {
+					const int ix = x0 + dx;
+					const int iy = y0 + dy;
+					if (ix < 0 || ix >= tex.width || iy < 0 || iy >= tex.height) continue;
+					const float weight = (dx ? fx : 1.0f - fx) * (dy ? fy : 1.0f - fy) / 255.0f;
+					const int index = (iy * tex.width + ix) * 4;
+					for (int c = 0; c < 4; c++) color[c] += tex.data[index + c] * weight;
+				}
+			}
+		}
+	} else {
+		SampleTexture(textures, texIndex, u, v, color);
+	}
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
 }
 
 /*
@@ -78,7 +130,7 @@ __device__ inline float DistributionGGX(float NdotH, float roughness) {
 	float NdotH2 = NdotH * NdotH;
 
 	float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
-	denom = M_PI * denom * denom;
+	denom = PT_PI * denom * denom;
 
 	return a2 / fmaxf(denom, 0.0001f);
 }
@@ -106,7 +158,7 @@ __device__ void EvaluateMaterial(
 	float* brdf
 ) {
 	float ndotwi = fmaxf(0.0f, dot3(normal, wi));
-	float diffuse = ndotwi / M_PI;
+	float diffuse = ndotwi / PT_PI;
 
 	brdf[0] = albedo[0] * diffuse;
 	brdf[1] = albedo[1] * diffuse;
@@ -174,9 +226,9 @@ __device__ void EvaluatePBRMaterial(
 
 	// Lambertian diffuse: albedo / pi
 	float diff[3];
-	diff[0] = kD[0] * albedo[0] / M_PI;
-	diff[1] = kD[1] * albedo[1] / M_PI;
-	diff[2] = kD[2] * albedo[2] / M_PI;
+	diff[0] = kD[0] * albedo[0] / PT_PI;
+	diff[1] = kD[1] * albedo[1] / PT_PI;
+	diff[2] = kD[2] * albedo[2] / PT_PI;
 
 	// return pure BRDF f(wo,wi) = diffuse + specular (NO NdotL here)
 	brdf[0] = diff[0] + specular[0];
