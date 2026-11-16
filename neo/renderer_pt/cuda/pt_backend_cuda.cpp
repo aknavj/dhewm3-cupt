@@ -46,7 +46,10 @@ public:
 	virtual bool			Render( const ptRenderParams_t &params );
 	virtual bool			ReadPixels( unsigned char *dest, int width, int height );
 
-	virtual void			ResetAccumulation() { accumFrames = 0; }
+	virtual void			ResetAccumulation( bool resetDenoising = true ) {
+		accumFrames = 0;
+		if ( resetDenoising ) denoiseHistoryValid = false;
+	}
 	virtual int				GetAccumulatedFrames() const { return accumFrames; }
 	virtual void			GetStats( ptBackendStats_t &stats ) const;
 
@@ -57,6 +60,8 @@ private:
 	void					FreeTextures();
 	bool					BuildBVH( const idPathTracerScene &scene );
 	void					OnError( const char *what, cudaError_t err );
+	bool					ResizeDenoiser( int width, int height );
+	void					FreeDenoiser();
 
 	bool					initialized;
 	bool					healthy;
@@ -68,11 +73,19 @@ private:
 	int						maxWidth;
 	int						maxHeight;
 	float *					d_accum;			// float4 HDR accumulation, row pitch == trace width
+	float *					d_filtered;			// float4 denoised HDR, never fed back into accumulation
 	unsigned char *			d_output;			// RGBA8
 	int						lastWidth;
 	int						lastHeight;
 	int						accumFrames;
 	float					traceMs;
+	ptCudaDenoiseBuffers_t	denoiser;
+	int						denoiseWidth;
+	int						denoiseHeight;
+	int						denoiseFrameSlot;
+	bool					denoiseHistoryValid;
+	ptRenderParams_t		previousDenoiseParams;
+	unsigned int			sampleSequence;
 
 	// scene, all grown on demand
 	ptVertex_t *			d_vertices;		int capVertices;
@@ -116,10 +129,17 @@ idPathTracerBackendCUDA::idPathTracerBackendCUDA() {
 
 	maxWidth = maxHeight = 0;
 	d_accum = NULL;
+	d_filtered = NULL;
 	d_output = NULL;
 	lastWidth = lastHeight = 0;
 	accumFrames = 0;
 	traceMs = 0.0f;
+	memset( &denoiser, 0, sizeof( denoiser ) );
+	memset( &previousDenoiseParams, 0, sizeof( previousDenoiseParams ) );
+	denoiseWidth = denoiseHeight = 0;
+	denoiseFrameSlot = 0;
+	denoiseHistoryValid = false;
+	sampleSequence = 0;
 
 	d_vertices = NULL;		capVertices = 0;
 	d_triangles = NULL;		capTriangles = 0;
@@ -266,6 +286,7 @@ void idPathTracerBackendCUDA::Shutdown() {
 
 	cudaFree( d_texDesc );			d_texDesc = NULL;
 	cudaFree( d_accum );			d_accum = NULL;
+	FreeDenoiser();
 	cudaFree( d_output );			d_output = NULL;
 	cudaFree( d_vertices );			d_vertices = NULL;		capVertices = 0;
 	cudaFree( d_triangles );		d_triangles = NULL;		capTriangles = 0;
@@ -322,6 +343,7 @@ bool idPathTracerBackendCUDA::Resize( int width, int height ) {
 	}
 
 	cudaFree( d_accum );	d_accum = NULL;
+	FreeDenoiser();
 	cudaFree( d_output );	d_output = NULL;
 	maxWidth = maxHeight = 0;
 
@@ -333,6 +355,41 @@ bool idPathTracerBackendCUDA::Resize( int width, int height ) {
 	maxHeight = height;
 	lastWidth = lastHeight = 0;
 	accumFrames = 0;
+	return true;
+}
+
+void idPathTracerBackendCUDA::FreeDenoiser() {
+	cudaFree( denoiser.radiance );
+	cudaFree( denoiser.scratch );
+	for ( int i = 0; i < 2; i++ ) {
+		cudaFree( denoiser.guides[i] );
+		cudaFree( denoiser.history[i] );
+		cudaFree( denoiser.moments[i] );
+	}
+	cudaFree( d_filtered );
+	d_filtered = NULL;
+	memset( &denoiser, 0, sizeof( denoiser ) );
+	denoiseWidth = denoiseHeight = 0;
+	denoiseFrameSlot = 0;
+	denoiseHistoryValid = false;
+}
+
+bool idPathTracerBackendCUDA::ResizeDenoiser( int width, int height ) {
+	if ( width == denoiseWidth && height == denoiseHeight ) return true;
+	PT_CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	FreeDenoiser();
+	const size_t pixels = (size_t)width * height;
+	const size_t colorBytes = pixels * 4 * sizeof( float );
+	PT_CUDA_CHECK( cudaMalloc( &denoiser.radiance, colorBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &denoiser.scratch, colorBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &d_filtered, colorBytes ) );
+	for ( int i = 0; i < 2; i++ ) {
+		PT_CUDA_CHECK( cudaMalloc( &denoiser.guides[i], pixels * sizeof( ptCudaDenoiseGuide_t ) ) );
+		PT_CUDA_CHECK( cudaMalloc( &denoiser.history[i], colorBytes ) );
+		PT_CUDA_CHECK( cudaMalloc( &denoiser.moments[i], colorBytes ) );
+	}
+	denoiseWidth = width;
+	denoiseHeight = height;
 	return true;
 }
 
@@ -482,6 +539,7 @@ bool idPathTracerBackendCUDA::UploadScene( const idPathTracerScene &scene ) {
 	if ( !healthy ) {
 		return false;
 	}
+	if ( scene.TextureGeneration() != textureGeneration ) denoiseHistoryValid = false;
 
 	numVertices = scene.Vertices().Num();
 	numTriangles = scene.Triangles().Num();
@@ -531,6 +589,7 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	if ( p.width != lastWidth || p.height != lastHeight ) {
 		accumFrames = 0;
+		denoiseHistoryValid = false;
 	}
 	lastWidth = p.width;
 	lastHeight = p.height;
@@ -539,6 +598,7 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	if ( numTriangles == 0 ) {
 		accumFrames = 0;
+		denoiseHistoryValid = false;
 		PT_CUDA_CHECK( cudaMemsetAsync( d_output, 0, pixels * 4, stream ) );
 		PT_CUDA_CHECK( cudaStreamSynchronize( stream ) );
 		return true;
@@ -553,6 +613,8 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 		PT_CUDA_CHECK( cudaMemsetAsync( d_accum, 0, pixels * 4 * sizeof( float ), stream ) );
 	}
 	p.frameIndex = accumFrames;
+	p.sampleIndex = sampleSequence++;
+	p.denoiseStrength = idMath::ClampFloat( 0.05f, 4.0f, p.denoiseStrength );
 
 	ptCudaSceneView_t view;
 	view.vertices = d_vertices;
@@ -566,17 +628,42 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	cudaEventRecord( timerStart, stream );
 
-	LaunchPathTracingKernel( &view, d_accum, &p, stream );
+	const bool denoise = accumulate && p.denoiseEnabled != 0;
+	if ( denoise ) {
+		if ( !ResizeDenoiser( p.width, p.height ) ) return false;
+		float forwardDot = 0.0f, cameraDistanceSquared = 0.0f;
+		for ( int c = 0; c < 3; c++ ) {
+			forwardDot += p.camForward[c] * previousDenoiseParams.camForward[c];
+			const float delta = p.camPos[c] - previousDenoiseParams.camPos[c];
+			cameraDistanceSquared += delta * delta;
+		}
+		if ( forwardDot < 0.5f || cameraDistanceSquared > 256.0f * 256.0f ) denoiseHistoryValid = false;
+	} else {
+		denoiseHistoryValid = false;
+	}
+	LaunchPathTracingKernel( &view, d_accum, denoise ? denoiser.radiance : NULL,
+		denoise ? denoiser.guides[denoiseFrameSlot] : NULL, &p, stream );
 	PT_CUDA_CHECK( cudaGetLastError() );
 
 	accumFrames++;
-	LaunchToneMappingKernel( d_accum, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode,
+	const float *hdrBuffer = d_accum;
+	if ( denoise ) {
+		PT_CUDA_CHECK( LaunchDenoisingKernel( &denoiser, d_accum, d_filtered, &p, &previousDenoiseParams,
+			denoiseFrameSlot, denoiseHistoryValid ? 1 : 0, stream ) );
+		hdrBuffer = d_filtered;
+	}
+	LaunchToneMappingKernel( hdrBuffer, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode,
 		stream );
 	PT_CUDA_CHECK( cudaGetLastError() );
 
 	cudaEventRecord( timerStop, stream );
 	PT_CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	cudaEventElapsedTime( &traceMs, timerStart, timerStop );
+	if ( denoise ) {
+		previousDenoiseParams = p;
+		denoiseHistoryValid = true;
+		denoiseFrameSlot ^= 1;
+	}
 	return true;
 }
 
@@ -608,6 +695,7 @@ void idPathTracerBackendCUDA::GetStats( ptBackendStats_t &stats ) const {
 	stats.numTextures = numTextures;
 	stats.deviceBytes = textureBytes
 		+ (size_t)maxWidth * maxHeight * 4 * ( sizeof( float ) + 1 )
+		+ (size_t)denoiseWidth * denoiseHeight * ( 7 * 4 * sizeof( float ) + 2 * sizeof( ptCudaDenoiseGuide_t ) )
 		+ (size_t)capVertices * sizeof( ptVertex_t )
 		+ (size_t)capTriangles * sizeof( ptTriangle_t )
 		+ (size_t)capBVHNodes * sizeof( ptBVHNode_t )

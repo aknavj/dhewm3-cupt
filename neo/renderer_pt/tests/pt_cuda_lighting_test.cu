@@ -282,7 +282,8 @@ static std::vector<float> Helpers(fixture_t& fixture) {
 	return result;
 }
 
-static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, float indirectProb, float emissionBoost) {
+static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, float indirectProb, float emissionBoost,
+	float expectedGuideDepth = 1.0f, int expectedHistoryValid = 1, int samplesPerPixel = 1) {
 	fixture.Upload();
 	ptRenderParams_t params = {};
 	params.camPos[2] = 1.0f;
@@ -290,7 +291,7 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	params.camRight[0] = 1.0f;
 	params.camUp[1] = 1.0f;
 	params.width = params.height = 256;
-	params.samplesPerPixel = 1;
+	params.samplesPerPixel = samplesPerPixel;
 	params.maxDepth = maxDepth;
 	params.maxLightSamples = maxLightSamples;
 	params.indirectProb = indirectProb;
@@ -307,6 +308,48 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	CUDA_CHECK(cudaGetLastError());
 	std::vector<float> framebuffer(pixels * 4);
 	CUDA_CHECK(cudaMemcpy(framebuffer.data(), d_framebuffer, framebuffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	ptCudaDenoiseGuide_t* d_guide = Allocate<ptCudaDenoiseGuide_t>(pixels);
+	float* d_radiance = Allocate<float>(pixels * 4);
+	CUDA_CHECK(cudaMemset(d_guide, 0xff, pixels * sizeof(ptCudaDenoiseGuide_t)));
+	CUDA_CHECK(cudaMemset(d_framebuffer, 0, pixels * 4 * sizeof(float)));
+	PathTracingKernel<<<grid, block>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_node, fixture.d_indices,
+		fixture.d_materials, fixture.d_textures, fixture.d_lights, 1, d_framebuffer, params, d_radiance, d_guide);
+	CUDA_CHECK(cudaGetLastError());
+	std::vector<float> guided(pixels * 4), radiance(pixels * 4);
+	std::vector<ptCudaDenoiseGuide_t> guide(pixels);
+	CUDA_CHECK(cudaMemcpy(guided.data(), d_framebuffer, guided.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(guide.data(), d_guide, guide.size() * sizeof(ptCudaDenoiseGuide_t), cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(radiance.data(), d_radiance, radiance.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	for (int i = 0; i < pixels * 4; i++) {
+		CheckNear("guide generation preserves radiance", guided[i], framebuffer[i], 0.0);
+		CheckNear("fresh radiance", radiance[i], framebuffer[i], 0.0);
+	}
+	for (int i = 0; i < pixels; i++) {
+		CheckNear("first surface guide depth", guide[i].depth, expectedGuideDepth, 1e-6);
+		const double normalLength = guide[i].normal[0] * guide[i].normal[0]
+			+ guide[i].normal[1] * guide[i].normal[1] + guide[i].normal[2] * guide[i].normal[2];
+		CheckNear("guide normal length", normalLength, expectedGuideDepth > 0.0f ? 1.0 : 0.0, 1e-6);
+		CheckNear("guide history eligibility", guide[i].historyValid, expectedGuideDepth > 0.0f ? expectedHistoryValid : 0, 0.0);
+		if (expectedGuideDepth > 0.0f) {
+			CheckNear("guide world position", guide[i].position[2], 0.0, 1e-6);
+			CheckNear("guide material", guide[i].materialIndex, 1, 0.0);
+			CheckNear("guide modulation color", guide[i].albedo[0], fixture.materials[1].albedo[0], 1e-6);
+		}
+	}
+	std::vector<float> accumulated(pixels * 4, 0.25f);
+	CUDA_CHECK(cudaMemcpy(d_framebuffer, accumulated.data(), accumulated.size() * sizeof(float), cudaMemcpyHostToDevice));
+	params.frameIndex = 4;
+	PathTracingKernel<<<grid, block>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_node, fixture.d_indices,
+		fixture.d_materials, fixture.d_textures, fixture.d_lights, 1, d_framebuffer, params, d_radiance, d_guide);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(accumulated.data(), d_framebuffer, accumulated.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(radiance.data(), d_radiance, radiance.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	for (int i = 0; i < pixels * 4; i++) {
+		CheckNear("fresh samples are independent of progressive mean", radiance[i], framebuffer[i], 0.0);
+		if (i % 4 != 3) CheckNear("raw progressive mean preserved", accumulated[i], (1.0f + framebuffer[i]) / 5.0f, 1e-6);
+	}
+	CUDA_CHECK(cudaFree(d_guide));
+	CUDA_CHECK(cudaFree(d_radiance));
 	CUDA_CHECK(cudaFree(d_framebuffer));
 	double total = 0.0;
 	for (int i = 0; i < pixels; i++) total += framebuffer[i * 4];
@@ -453,6 +496,31 @@ int main() {
 	CheckNear("single-depth sampled emitter suppression", TracePath(fixture, 1, 1, 1.0f, 1.0f), direct, 1e-5);
 	fixture.triangles[0].flags &= ~PT_TRI_AREA_LIGHT;
 	CheckNear("unrepresented path emitter", TracePath(fixture, 2, 1, 0.0f, 1.0f), direct + bounce, 0.006);
+
+	TracePath(fixture, 2, 1, 0.0f, 1.0f, 1.0f, 1, 4);
+	fixture.triangles[1].flags |= PT_TRI_NO_HISTORY;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 1.0f, 0);
+	fixture.triangles[1].flags &= ~PT_TRI_NO_HISTORY;
+	fixture.materials[1].roughness = 0.1f;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.materials[1].roughness = 1.0f;
+	fixture.materials[1].metallic = 1.0f;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.materials[1].metallic = 0.0f;
+	fixture.materials[1].emission[0] = 0.1f;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.materials[1].emission[0] = 0.0f;
+	fixture.materials[1].transmission = 1.0f;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.materials[1].transmission = 0.0f;
+	fixture.materials[1].isAmbientOnly = 1;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.materials[1].isAmbientOnly = 0;
+	fixture.materials[1].alphaTest = 0.5f;
+	fixture.materials[1].albedo[3] = 0.0f;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	fixture.node.primitiveCount = 0;
+	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
 
 	std::puts("CUDA lighting regression checks passed");
 	return 0;

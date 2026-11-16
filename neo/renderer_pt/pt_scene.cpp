@@ -178,6 +178,12 @@ void idPathTracerScene::AddDrawSurface( const drawSurf_t *surf ) {
 	const float *modelMatrix = surf->space ? surf->space->modelMatrix : NULL;
 
 	int triFlags = 0;
+	// Until object motion vectors are available, only world surfaces reuse history.
+	if ( !surf->space || !surf->space->entityDef || !surf->space->entityDef->parms.hModel
+		|| !surf->space->entityDef->parms.hModel->IsStaticWorldModel()
+		|| ( surf->material && surf->material->Deform() != DFRM_NONE ) ) {
+		triFlags |= PT_TRI_NO_HISTORY;
+	}
 	if ( surf->space ) {
 		if ( surf->space->weaponDepthHack ) {
 			triFlags |= PT_TRI_WEAPON;

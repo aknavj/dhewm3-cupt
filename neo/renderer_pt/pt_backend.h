@@ -55,14 +55,15 @@ public:
 	// rebuilds the acceleration structure
 	virtual bool			UploadScene( const idPathTracerScene &scene ) = 0;
 
-	// traces params.width x params.height pixels into the accumulation buffer and
-	// tone maps the result into an RGBA8 image
+	// traces params.width x params.height into raw accumulation; optionally denoises
+	// fresh samples with separate history, then tone maps the selected result to RGBA8
 	virtual bool			Render( const ptRenderParams_t &params ) = 0;
 
 	// copies the last rendered RGBA8 image (width x height of the last Render) to dest
 	virtual bool			ReadPixels( unsigned char *dest, int width, int height ) = 0;
 
-	virtual void			ResetAccumulation() = 0;
+	// Camera movement can clear the raw mean without discarding reprojectable history.
+	virtual void			ResetAccumulation( bool resetDenoising = true ) = 0;
 	virtual int				GetAccumulatedFrames() const = 0;
 
 	virtual void			GetStats( ptBackendStats_t &stats ) const = 0;

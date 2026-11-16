@@ -7,6 +7,7 @@
 #include "renderer_pt/cuda/pt_kernel_triangles_textured.cuh"
 #include "renderer_pt/cuda/pt_kernel_triangles_raytraced.cuh"
 #include "renderer_pt/cuda/pt_kernel_pathtracing.cuh"
+#include "renderer_pt/cuda/pt_kernel_denoising.cuh"
 
 /*
 ========================
@@ -17,6 +18,7 @@ kernel: they are only dereferenceable on HMM/ATS capable systems.
 ========================
 */
 extern "C" void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer,
+										 float *radianceBuffer, ptCudaDenoiseGuide_t *guideBuffer,
 										 const ptRenderParams_t *params, cudaStream_t stream ) {
 	const ptRenderParams_t p = *params;
 
@@ -56,9 +58,37 @@ extern "C" void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *
 		default:
 			PathTracingKernel<<<gridSize, blockSize, 0, stream>>>(
 				s.vertices, s.triangles, s.bvhNodes, s.triIndices, s.materials, s.textures, s.lights, s.numLights,
-				accumBuffer, p );
+				accumBuffer, p, radianceBuffer, guideBuffer );
 			break;
 	}
+}
+
+extern "C" cudaError_t LaunchDenoisingKernel( const ptCudaDenoiseBuffers_t *buffers, const float *accumBuffer, float *filteredBuffer,
+											 const ptRenderParams_t *params, const ptRenderParams_t *previousParams,
+											 int frameSlot, int historyValid, cudaStream_t stream ) {
+	const ptRenderParams_t p = *params;
+	const ptCudaDenoiseBuffers_t &b = *buffers;
+	const int prev = frameSlot ^ 1;
+	const dim3 blockSize( TILE_SIZE, TILE_SIZE );
+	const dim3 gridSize( ( p.width + TILE_SIZE - 1 ) / TILE_SIZE, ( p.height + TILE_SIZE - 1 ) / TILE_SIZE );
+	SVGFTemporalKernel<<<gridSize, blockSize, 0, stream>>>(
+		b.radiance, b.guides[frameSlot], b.guides[prev], b.history[prev], b.moments[prev],
+		filteredBuffer, b.moments[frameSlot], p, *previousParams, historyValid );
+	cudaError_t error = cudaGetLastError();
+	if ( error != cudaSuccess ) return error;
+
+	const float *input = filteredBuffer;
+	for ( int iteration = 0; iteration < 4; iteration++ ) {
+		float *output = iteration == 0 ? b.history[frameSlot] : ( iteration == 2 ? filteredBuffer : b.scratch );
+		SVGFAtrousKernel<<<gridSize, blockSize, 0, stream>>>(
+			input, b.guides[frameSlot], output, p.width, p.height, 1 << iteration, p.denoiseStrength );
+		error = cudaGetLastError();
+		if ( error != cudaSuccess ) return error;
+		input = output;
+	}
+	SVGFResolveKernel<<<gridSize, blockSize, 0, stream>>>(
+		input, accumBuffer, b.guides[frameSlot], filteredBuffer, p.width, p.height );
+	return cudaGetLastError();
 }
 
 /*

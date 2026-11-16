@@ -61,6 +61,8 @@ idCVar r_ptSpecularBoost( "r_ptSpecularBoost", "2.0", CVAR_RENDERER | CVAR_ARCHI
 idCVar r_ptSoftShadowScale( "r_ptSoftShadowScale", "0.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "soft shadow jitter (0 = hard shadows)" );
 
 // display
+idCVar r_ptDenoise( "r_ptDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "SVGF temporal/variance-guided denoising for path tracing (raw accumulation is preserved)" );
+idCVar r_ptDenoiseStrength( "r_ptDenoiseStrength", "0.5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "SVGF variance-guided luminance sigma scale: higher values smooth more", 0.05f, 4.0f );
 idCVar r_ptExposure( "r_ptExposure", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "exposure multiplier" );
 idCVar r_ptGamma( "r_ptGamma", "2.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "output gamma, textures and colors are decoded with 2.2", 0.1f, 10.0f );
 idCVar r_ptToneMapMode( "r_ptToneMapMode", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "0 = Reinhard, 1 = ACES, 2 = Uncharted 2", 0, 2 );
@@ -448,6 +450,8 @@ static void PT_SetupParams( ptRenderParams_t &p, const viewDef_t *viewDef, int t
 	p.volFalloff = Max( 0.0f, r_ptVolFalloff.GetFloat() );
 	p.volMaxDist = Max( 0.0f, r_ptVolMaxDist.GetFloat() );
 
+	p.denoiseEnabled = r_ptDenoise.GetBool() ? 1 : 0;
+	p.denoiseStrength = r_ptDenoiseStrength.GetFloat();
 	p.exposure = Max( 0.001f, r_ptExposure.GetFloat() );
 	p.gamma = r_ptGamma.GetFloat();
 	p.toneMapMode = r_ptToneMapMode.GetInteger();
@@ -483,6 +487,21 @@ static void PT_ApplyProgressiveQuality( ptRenderParams_t &p, int frame ) {
 PT_ViewChanged
 ========================
 */
+static bool PT_TraceSettingsChanged( const ptRenderParams_t &a, const ptRenderParams_t &b ) {
+	for ( int i = 0; i < 3; i++ ) {
+		if ( a.skyZenith[i] != b.skyZenith[i] || a.skyHorizon[i] != b.skyHorizon[i] || a.skyGround[i] != b.skyGround[i] ) return true;
+	}
+	return a.width != b.width || a.height != b.height || a.renderMode != b.renderMode
+		|| a.samplesPerPixel != b.samplesPerPixel || a.maxDepth != b.maxDepth
+		|| a.maxLightSamples != b.maxLightSamples || a.indirectProb != b.indirectProb
+		|| a.rrEnabled != b.rrEnabled || a.rrMinBounces != b.rrMinBounces || a.rrSurvivalMin != b.rrSurvivalMin
+		|| a.earlyTermThreshold != b.earlyTermThreshold || a.throughputClamp != b.throughputClamp || a.fireflyClamp != b.fireflyClamp
+		|| a.rayOffset != b.rayOffset || a.emissionBoost != b.emissionBoost || a.specularBoost != b.specularBoost
+		|| a.softShadowScale != b.softShadowScale || a.skyIntensity != b.skyIntensity
+		|| a.volDensity != b.volDensity || a.volSteps != b.volSteps || a.volAnisotropy != b.volAnisotropy
+		|| a.volFalloff != b.volFalloff || a.volMaxDist != b.volMaxDist;
+}
+
 static bool PT_ViewChanged( const ptRenderParams_t &a, const ptRenderParams_t &b ) {
 	const float eps = 1e-4f;
 	for ( int i = 0; i < 3; i++ ) {
@@ -492,11 +511,7 @@ static bool PT_ViewChanged( const ptRenderParams_t &a, const ptRenderParams_t &b
 			return true;
 		}
 	}
-	return idMath::Fabs( a.fovX - b.fovX ) > eps || idMath::Fabs( a.fovY - b.fovY ) > eps
-		|| a.width != b.width || a.height != b.height || a.renderMode != b.renderMode
-		|| a.samplesPerPixel != b.samplesPerPixel || a.maxDepth != b.maxDepth
-		|| a.maxLightSamples != b.maxLightSamples
-		|| a.emissionBoost != b.emissionBoost;
+	return idMath::Fabs( a.fovX - b.fovX ) > eps || idMath::Fabs( a.fovY - b.fovY ) > eps;
 }
 
 /*
@@ -613,15 +628,16 @@ bool RB_PT_DrawView( void ) {
 	PT_SetupParams( params, viewDef, traceWidth, traceHeight );
 
 	const float lightScale = Max( 0.0f, r_lightScale.GetFloat() );
-	bool reset = !r_ptAccumulation.GetBool() || !pt.havePrev || PT_ViewChanged( params, pt.prevParams )
+	bool resetHistory = !pt.havePrev || PT_TraceSettingsChanged( params, pt.prevParams )
 		|| lightScale != pt.prevLightScale;
 	switch ( r_ptResetOnSceneChange.GetInteger() ) {
-		case 2:		reset |= pt.scene->ContentHash() != pt.prevContentHash;		// fall through
-		case 1:		reset |= pt.scene->StructureHash() != pt.prevStructureHash;	break;
+		case 2:		resetHistory |= pt.scene->ContentHash() != pt.prevContentHash;		// fall through
+		case 1:		resetHistory |= pt.scene->StructureHash() != pt.prevStructureHash;	break;
 		default:	break;
 	}
+	const bool reset = resetHistory || !r_ptAccumulation.GetBool() || PT_ViewChanged( params, pt.prevParams );
 	if ( reset ) {
-		pt.backend->ResetAccumulation();
+		pt.backend->ResetAccumulation( resetHistory );
 	}
 	pt.prevParams = params;
 	pt.prevContentHash = pt.scene->ContentHash();

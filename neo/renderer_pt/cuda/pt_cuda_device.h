@@ -108,10 +108,35 @@ typedef struct {
 	int						numLights;
 } ptCudaSceneView_t;
 
+typedef struct {
+	float normal[3];
+	float depth;				// <= 0: bypass denoising
+	float position[3];			// world-space hit position for camera reprojection
+	int materialIndex;
+	float albedo[3];				// bounded modulation color
+	int historyValid;			// dynamic entities have spatial filtering only
+} ptCudaDenoiseGuide_t;
+
+typedef struct {
+	float *radiance;				// fresh float4 HDR, not the progressive mean
+	ptCudaDenoiseGuide_t *guides[2];
+	float *history[2];			// float4 illumination + variance, after the first atrous pass
+	float *moments[2];			// float4: luminance, squared luminance, history length, unused
+	float *scratch;				// float4 illumination + variance
+} ptCudaDenoiseBuffers_t;
+
 // traces params.width x params.height into the float4 accumulation buffer
 // (row pitch == params.width)
 void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer,
+							  float *radianceBuffer, ptCudaDenoiseGuide_t *guideBuffer,
 							  const ptRenderParams_t *params, cudaStream_t stream );
+
+// Temporal reprojection/moments, four atrous passes and albedo remodulation.
+// frameSlot selects current guides/history/moments; the other slot is read-only.
+// Bypassed surfaces display raw accumulation instead of losing static convergence.
+cudaError_t LaunchDenoisingKernel( const ptCudaDenoiseBuffers_t *buffers, const float *accumBuffer, float *filteredBuffer,
+								  const ptRenderParams_t *params, const ptRenderParams_t *previousParams,
+								  int frameSlot, int historyValid, cudaStream_t stream );
 
 // resolves the accumulation buffer into RGBA8
 void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,

@@ -41,7 +41,8 @@ enum ptTriangleFlags_t {
 	PT_TRI_WEAPON			= 1,	// view weapon (weaponDepthHack): seen by camera rays only, never occludes
 	PT_TRI_NO_OCCLUDE		= 2,	// never blocks shadow rays (noShadows, additive, unlit overlays)
 	PT_TRI_OPAQUE			= 4,	// always blocks shadow rays, no material lookup needed
-	PT_TRI_AREA_LIGHT		= 8		// also sampled as a PT_LIGHT_AREA
+	PT_TRI_AREA_LIGHT		= 8,	// also sampled as a PT_LIGHT_AREA
+	PT_TRI_NO_HISTORY		= 16	// no object motion vectors: spatial denoising only
 };
 
 enum ptBlendMode_t {
@@ -177,6 +178,7 @@ typedef struct {
 
 	int renderMode;				// ptRenderMode_t
 	int frameIndex;				// filled in by the backend (accumulated frame count)
+	unsigned int sampleIndex;	// independent RNG sequence, does not restart when the camera moves
 
 	// sampling
 	int samplesPerPixel;
@@ -212,6 +214,8 @@ typedef struct {
 	float volMaxDist;
 
 	// display
+	int denoiseEnabled;
+	float denoiseStrength;	// variance-guided luminance sigma scale
 	float exposure;
 	float gamma;
 	int toneMapMode;			// ptToneMap_t

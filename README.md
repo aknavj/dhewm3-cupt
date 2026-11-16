@@ -69,7 +69,52 @@ and all GUI drawing on top of the 3D view.
 - **Cache invalidation** after `reloadImages`, plus identity checks to avoid stale cache hits when
   engine pointers are reused
 - **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
+- **SVGF denoising**: illumination demodulation, camera reprojection, temporal luminance
+  moments, variance-guided multi-scale atrous filtering, and albedo restoration before tone mapping
 - **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
+
+### Denoising
+
+The CUDA denoiser implements a practical SVGF core inspired by
+[original Q2VKPT's approach](https://developer.nvidia.com/blog/path-tracing-quake-ii/),
+not a full port of Q2VKPT's adaptive A-SVGF pipeline:
+
+1. Trace fresh per-frame HDR samples alongside the untouched progressive mean. Keep
+   world position, shading normal, camera-forward depth, material identity, and bounded
+   primary albedo as guides, without additional guide rays. Average modulation color
+   across samples; bypass pixels whose samples disagree on the primary surface.
+2. Divide eligible radiance by primary albedo, reproject static-world history through
+   the previous camera, and reject incompatible depth, normals, materials, or albedo.
+3. Accumulate luminance moments and bounded temporal history (up to 32 frames, with
+   a minimum new-color weight of 0.08). Bootstrap variance from the spatial neighborhood
+   for new/disoccluded pixels. Neighborhood clipping and lighting-change rejection
+   limit stale history, but are not the correlated temporal gradients of A-SVGF.
+4. Run four variance-guided atrous passes at pixel spacings 1, 2, 4, and 8. Retain the
+   first-pass illumination as feedback, then restore current albedo for display.
+
+Enabled by default in path tracing mode only. `r_ptDenoise 0` displays the raw progressive
+mean; `r_ptDenoiseStrength` adjusts the variance-guided luminance sigma. Denoising uses
+fresh samples, not the already averaged raw buffer, so it remains responsive while moving.
+`r_ptAccumulation` controls the raw progressive mean independently of SVGF history.
+Use `r_ptDenoise 0` for progressively converged reference captures with `r_ptCompare`
+or `r_ptSequence`; with denoising enabled they capture the bounded-history SVGF result.
+
+Camera movement resets the raw mean without automatically throwing away reprojectable
+history. Explicit resets, resolution/backend/texture changes, trace-setting changes,
+configured scene invalidations, and camera cuts invalidate denoiser history. Changing
+exposure or gamma, or toggling denoising, does not alter the raw accumulation.
+
+This stage has no object motion vectors: non-world/deforming surfaces and view weapons
+receive spatial filtering only, never temporal reuse. Sky, transparent, ambient-only,
+no-shadows, emissive, glossy (roughness below 0.4), and metallic (metallicity at least 0.2)
+primary surfaces bypass denoising. Eligible rough surfaces use combined radiance
+demodulation, not separate diffuse/specular signal channels. Adaptive gradient sampling,
+specular/transmission denoising, and TAA remain future work; low-sample silhouettes
+can still shimmer. Bypassed pixels display the raw progressive mean, so static glossy
+and emissive surfaces can still converge.
+
+Denoiser storage is allocated lazily at the trace resolution: 208 additional bytes per
+pixel (about 103 MiB at 960x540), rather than at full window resolution.
 
 Generated area lights share a target budget of 512 lights with engine light stages. Engine
 light stages take priority and can grow beyond that budget; any emissive triangles that do
@@ -109,6 +154,14 @@ This test also works without CUDA.
 For the GPU lighting regression test, also configure with `-DPT_CUDA_LIGHTING_TESTS=ON`,
 build `pt_cuda_lighting_test`, and run `ctest -R pt_cuda_lighting --output-on-failure`.
 It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is available.
+
+For the GPU denoising regression test, configure with `-DPT_CUDA_DENOISING_TESTS=ON`,
+build `pt_cuda_denoising_test`, and run `ctest -R pt_cuda_denoising --output-on-failure`.
+It checks noise reduction, temporal reuse and bounded history, camera reprojection,
+disocclusion/lighting-change rejection, texture restoration, edge preservation, small/odd
+image sizes, and tone-mapped output. It skips if no CUDA device or driver is available.
+The lighting regression test also checks guide eligibility, multi-sample guide generation,
+fresh radiance independent of the progressive mean, and unchanged raw accumulation.
 
 ## Console Commands
 
@@ -169,6 +222,8 @@ reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
 | `r_ptEmissionBoost` | `1.0` | Emission multiplier |
 | `r_ptSpecularBoost` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
 | `r_ptSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard shadows) |
+| `r_ptDenoise` | `1` | SVGF temporal/variance-guided denoising in path tracing mode only |
+| `r_ptDenoiseStrength` | `0.5` | Variance-guided luminance sigma scale (0.05–4); higher values smooth more |
 | `r_ptExposure` | `1.0` | Exposure multiplier |
 | `r_ptGamma` | `2.2` | Output gamma, textures and colors are decoded with 2.2 |
 | `r_ptToneMapMode` | `1` | 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |

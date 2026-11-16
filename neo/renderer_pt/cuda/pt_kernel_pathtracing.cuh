@@ -380,7 +380,9 @@ __global__ void PathTracingKernel(
 	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	const ptRenderParams_t params
+	const ptRenderParams_t params,
+	float* radianceBuffer = NULL,
+	ptCudaDenoiseGuide_t* guideBuffer = NULL
 ) {
 	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -391,11 +393,14 @@ __global__ void PathTracingKernel(
 	int pixelIndex = (y * width + x) * 4;
 
 	ptRng_t rng;
-	PT_RngInit(&rng, (unsigned int)(y * width + x), (unsigned int)frameIndex);
+	PT_RngInit(&rng, (unsigned int)(y * width + x), params.sampleIndex);
 
 	float color[3] = { 0.0f, 0.0f, 0.0f };
+	ptCudaDenoiseGuide_t guide = {};
 
 	for (int sample = 0; sample < samplesPerPixel; sample++) {
+		bool guideWritten = false;
+		ptCudaDenoiseGuide_t sampleGuide = {};
 		// primary ray with jitter
 		float jitterX = PT_Rand(&rng) - 0.5f;
 		float jitterY = PT_Rand(&rng) - 0.5f;
@@ -588,6 +593,27 @@ __global__ void PathTracingKernel(
 				ray.origin[2] = hitInfo.position[2] + ray.direction[2] * rayOffset;
 				ray.tMin = rayOffset;
 				continue;  // transparent skip — does NOT increment depth
+			}
+
+			// Use a single-layer guide only for rough, non-emissive opaque surfaces.
+			// Glossy/specular and transparent transport need separate signal channels.
+			if (guideBuffer && !guideWritten) {
+				guideWritten = true;
+				if (material.blendMode == PT_BLEND_OPAQUE && material.transmission == 0.0f
+					&& !material.isAmbientOnly && !material.noShadows
+					&& roughness >= 0.4f && metallic < 0.2f
+					&& material.emission[0] + material.emission[1] + material.emission[2] == 0.0f) {
+					float cameraDelta[3];
+					for (int c = 0; c < 3; c++) {
+						sampleGuide.normal[c] = surfaceNormal[c];
+						sampleGuide.position[c] = hitInfo.position[c];
+						sampleGuide.albedo[c] = fmaxf(0.04f, albedo[c]);
+						cameraDelta[c] = hitInfo.position[c] - cameraPos[c];
+					}
+					sampleGuide.depth = dot3(cameraDelta, cameraForward);
+					sampleGuide.materialIndex = hitInfo.materialIndex;
+					sampleGuide.historyValid = (hitInfo.triFlags & (PT_TRI_NO_HISTORY | PT_TRI_WEAPON)) == 0;
+				}
 			}
 
 			// ---------------------------------------------------------------
@@ -947,6 +973,21 @@ __global__ void PathTracingKernel(
 		color[0] += pathRadiance[0];
 		color[1] += pathRadiance[1];
 		color[2] += pathRadiance[2];
+		if (guideBuffer) {
+			if (sample == 0) {
+				guide = sampleGuide;
+			} else if (guide.depth > 0.0f) {
+				if (sampleGuide.depth <= 0.0f || sampleGuide.materialIndex != guide.materialIndex
+					|| dot3(sampleGuide.normal, guide.normal) < 0.9f
+					|| fabsf(sampleGuide.depth - guide.depth) > fmaxf(0.01f, guide.depth * 0.02f)) {
+					guide.depth = 0.0f;
+					guide.historyValid = 0;
+				} else {
+					for (int c = 0; c < 3; c++) guide.albedo[c] += sampleGuide.albedo[c];
+					guide.historyValid &= sampleGuide.historyValid;
+				}
+			}
+		}
 
 	}  // end sample loop
 
@@ -965,6 +1006,16 @@ __global__ void PathTracingKernel(
 	// NaN/Inf guard
 	if (!isfinite(color[0]) || !isfinite(color[1]) || !isfinite(color[2])) {
 		color[0] = color[1] = color[2] = 0.0f;
+	}
+	if (radianceBuffer) {
+		for (int c = 0; c < 3; c++) radianceBuffer[pixelIndex + c] = color[c];
+		radianceBuffer[pixelIndex + 3] = 1.0f;
+	}
+	if (guideBuffer) {
+		if (guide.depth > 0.0f) {
+			for (int c = 0; c < 3; c++) guide.albedo[c] /= samplesPerPixel;
+		}
+		guideBuffer[y * width + x] = guide;
 	}
 
 	// Running mean avoids the precision loss of an ever-growing frame sum.
