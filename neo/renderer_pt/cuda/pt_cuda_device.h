@@ -109,26 +109,60 @@ typedef struct {
 } ptCudaSceneView_t;
 
 typedef struct {
-	float normal[3];
+	float normal[3];				// unperturbed surface normal for temporal validation
 	float depth;				// <= 0: bypass denoising
 	float position[3];			// world-space hit position for camera reprojection
 	int materialIndex;
 	float albedo[3];				// bounded modulation color
 	int historyValid;			// dynamic entities have spatial filtering only
+	float shadingNormal[3];
+	float roughness;
+	float specularAlbedo[3];
+	int coverage;				// ptDenoiseCoverage_t
 } ptCudaDenoiseGuide_t;
 
+enum ptDenoiseCoverage_t {
+	PT_DENOISE_MISS,
+	PT_DENOISE_STATIC,
+	PT_DENOISE_DYNAMIC,
+	PT_DENOISE_TRANSPARENT,
+	PT_DENOISE_OVERLAY,
+	PT_DENOISE_MIXED
+};
+
+enum ptDenoiseReject_t {
+	PT_DENOISE_REUSED,
+	PT_DENOISE_RESET,
+	PT_DENOISE_UNSUPPORTED,
+	PT_DENOISE_NO_MOTION,
+	PT_DENOISE_OFFSCREEN,
+	PT_DENOISE_DEPTH,
+	PT_DENOISE_NORMAL,
+	PT_DENOISE_MATERIAL,
+	PT_DENOISE_REFLECTANCE,
+	PT_DENOISE_LIGHTING,
+	PT_DENOISE_NO_SAMPLES
+};
+
 typedef struct {
-	float *radiance;				// fresh float4 HDR, not the progressive mean
+	float *radiance;
+	float *history[2];			// realtime: illumination + variance; capture: raw mean RGB + E[luminance^2]
+	float *moments[2];			// float4: luminance, squared luminance, history length, rejection reason
+} ptCudaDenoiseSignal_t;
+
+typedef struct {
+	float *radiance;				// full fresh HDR, including unfiltered emission/volume
+	ptCudaDenoiseSignal_t signals[2];	// diffuse, specular
 	ptCudaDenoiseGuide_t *guides[2];
-	float *history[2];			// float4 illumination + variance, after the first atrous pass
-	float *moments[2];			// float4: luminance, squared luminance, history length, unused
 	float *scratch;				// float4 illumination + variance
+	float *filteredDiffuse;
 } ptCudaDenoiseBuffers_t;
 
 // traces params.width x params.height into the float4 accumulation buffer
 // (row pitch == params.width)
 void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer,
 							  float *radianceBuffer, ptCudaDenoiseGuide_t *guideBuffer,
+							  float *diffuseBuffer, float *specularBuffer,
 							  const ptRenderParams_t *params, cudaStream_t stream );
 
 // Temporal reprojection/moments, four atrous passes and albedo remodulation.
@@ -137,6 +171,9 @@ void LaunchPathTracingKernel( const ptCudaSceneView_t *scene, float *accumBuffer
 cudaError_t LaunchDenoisingKernel( const ptCudaDenoiseBuffers_t *buffers, const float *accumBuffer, float *filteredBuffer,
 								  const ptRenderParams_t *params, const ptRenderParams_t *previousParams,
 								  int frameSlot, int historyValid, cudaStream_t stream );
+
+cudaError_t LaunchDenoisingDebugKernel( const ptCudaDenoiseBuffers_t *buffers, unsigned char *output,
+								const ptRenderParams_t *params, int frameSlot, cudaStream_t stream );
 
 // resolves the accumulation buffer into RGBA8
 void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,

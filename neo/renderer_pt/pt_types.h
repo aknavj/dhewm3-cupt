@@ -215,7 +215,10 @@ typedef struct {
 
 	// display
 	int denoiseEnabled;
+	int captureTargetFrames;	// > 0: offline progressive capture, no temporal history cap
 	float denoiseStrength;	// variance-guided luminance sigma scale
+	int denoiseDebug;		// 0 beauty, 1 coverage, 2 history, 3 variance, 4 rejection, 5 diffuse, 6 specular
+	int denoiseDebugSignal;	// 0 diffuse, 1 specular
 	float exposure;
 	float gamma;
 	int toneMapMode;			// ptToneMap_t

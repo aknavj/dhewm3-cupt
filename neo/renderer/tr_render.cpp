@@ -948,9 +948,11 @@ void RB_DrawView( const void *data ) {
 	}
 
 #ifdef HAVE_PATHTRACER
-	// drive the path tracer compare / sequence state machines
-	RB_PT_CompareCheck();
-	RB_PT_SequenceCheck();
+	// Loading screens, GUIs and screenshot redraws must not advance captures.
+	if ( backEnd.viewDef->viewEntitys && !backEnd.viewDef->isSubview && !tr.takingScreenshot ) {
+		RB_PT_CompareCheck();
+		RB_PT_SequenceCheck();
+	}
 #endif
 
 	RB_GLSequenceCheck();

@@ -382,7 +382,9 @@ __global__ void PathTracingKernel(
 	float* framebuffer,
 	const ptRenderParams_t params,
 	float* radianceBuffer = NULL,
-	ptCudaDenoiseGuide_t* guideBuffer = NULL
+	ptCudaDenoiseGuide_t* guideBuffer = NULL,
+	float* diffuseBuffer = NULL,
+	float* specularBuffer = NULL
 ) {
 	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -396,6 +398,7 @@ __global__ void PathTracingKernel(
 	PT_RngInit(&rng, (unsigned int)(y * width + x), params.sampleIndex);
 
 	float color[3] = { 0.0f, 0.0f, 0.0f };
+	float diffuseColor[3] = {}, specularColor[3] = {};
 	ptCudaDenoiseGuide_t guide = {};
 
 	for (int sample = 0; sample < samplesPerPixel; sample++) {
@@ -428,6 +431,9 @@ __global__ void PathTracingKernel(
 
 		float pathThroughput[3] = { 1.0f, 1.0f, 1.0f };
 		float pathRadiance[3] = { 0.0f, 0.0f, 0.0f };
+		float sampleDiffuse[3] = {}, sampleSpecular[3] = {}, volumeRadiance[3] = {};
+		float indirectBaseline[3] = {}, volumeBaseline[3] = {}, diffuseFraction[3] = {};
+		bool splitIndirect = false;
 		bool lastSampledLights = false;
 
 		int depth = 0;
@@ -595,24 +601,28 @@ __global__ void PathTracingKernel(
 				continue;  // transparent skip — does NOT increment depth
 			}
 
-			// Use a single-layer guide only for rough, non-emissive opaque surfaces.
-			// Glossy/specular and transparent transport need separate signal channels.
+			// Primary emission and volume remain residuals; only surface-scattered light is filtered.
 			if (guideBuffer && !guideWritten) {
 				guideWritten = true;
+				sampleGuide.coverage = material.blendMode != PT_BLEND_OPAQUE || material.transmission > 0.0f
+					? PT_DENOISE_TRANSPARENT : PT_DENOISE_OVERLAY;
 				if (material.blendMode == PT_BLEND_OPAQUE && material.transmission == 0.0f
-					&& !material.isAmbientOnly && !material.noShadows
-					&& roughness >= 0.4f && metallic < 0.2f
-					&& material.emission[0] + material.emission[1] + material.emission[2] == 0.0f) {
+					&& !material.isAmbientOnly && (!material.noShadows || material.alphaTest > 0.0f)) {
 					float cameraDelta[3];
 					for (int c = 0; c < 3; c++) {
-						sampleGuide.normal[c] = surfaceNormal[c];
+						sampleGuide.normal[c] = hitInfo.normal[c];
+						sampleGuide.shadingNormal[c] = surfaceNormal[c];
 						sampleGuide.position[c] = hitInfo.position[c];
-						sampleGuide.albedo[c] = fmaxf(0.04f, albedo[c]);
+						sampleGuide.albedo[c] = fmaxf(0.04f, albedo[c] * (1.0f - metallic));
+						const float f0 = 0.04f * (1.0f - metallic) + albedo[c] * metallic;
+						sampleGuide.specularAlbedo[c] = fmaxf(0.01f, f0 * specularBoost * specColor[c]);
 						cameraDelta[c] = hitInfo.position[c] - cameraPos[c];
 					}
 					sampleGuide.depth = dot3(cameraDelta, cameraForward);
+					sampleGuide.roughness = fminf(1.0f, fmaxf(0.04f, roughness));
 					sampleGuide.materialIndex = hitInfo.materialIndex;
 					sampleGuide.historyValid = (hitInfo.triFlags & (PT_TRI_NO_HISTORY | PT_TRI_WEAPON)) == 0;
+					sampleGuide.coverage = sampleGuide.historyValid ? PT_DENOISE_STATIC : PT_DENOISE_DYNAMIC;
 				}
 			}
 
@@ -780,13 +790,21 @@ __global__ void PathTracingKernel(
 					const float lightWeight = pickWeights[i];
 					if (material.blendMode == PT_BLEND_OPAQUE || material.blendMode == PT_BLEND_ALPHA) {
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
-						float directBrdf[3];
-						EvaluatePBRMaterial(albedo, surfaceNormal, wo, wi, metallic, roughness, specularBoost, specColor, directBrdf);
+						float directBrdf[3], diffuseBrdf[3];
+						EvaluatePBRMaterial(albedo, surfaceNormal, wo, wi, metallic, roughness, specularBoost, specColor,
+							directBrdf, diffuseBrdf);
 
 						float alphaScale = (material.blendMode == PT_BLEND_ALPHA) ? albedo[3] : 1.0f;
 						pathRadiance[0] += pathThroughput[0] * directLight[0] * directBrdf[0] * alphaScale * lightWeight;
 						pathRadiance[1] += pathThroughput[1] * directLight[1] * directBrdf[1] * alphaScale * lightWeight;
 						pathRadiance[2] += pathThroughput[2] * directLight[2] * directBrdf[2] * alphaScale * lightWeight;
+						if (sampleGuide.depth > 0.0f && depth == 0) {
+							for (int c = 0; c < 3; c++) {
+								const float incoming = pathThroughput[c] * directLight[c] * alphaScale * lightWeight;
+								sampleDiffuse[c] += incoming * diffuseBrdf[c];
+								sampleSpecular[c] += incoming * (directBrdf[c] - diffuseBrdf[c]);
+							}
+						}
 					} else {
 						// fallback Lambertian
 						pathRadiance[0] += pathThroughput[0] * directLight[0] * albedo[0] * lightWeight;
@@ -817,6 +835,7 @@ __global__ void PathTracingKernel(
 					pathRadiance[0] += pathThroughput[0] * volumetric[0] * lightWeight;
 					pathRadiance[1] += pathThroughput[1] * volumetric[1] * lightWeight;
 					pathRadiance[2] += pathThroughput[2] * volumetric[2] * lightWeight;
+					for (int c = 0; c < 3; c++) volumeRadiance[c] += pathThroughput[c] * volumetric[c] * lightWeight;
 				}
 			}
 
@@ -842,11 +861,12 @@ __global__ void PathTracingKernel(
 					if (!isfinite(indirectLight[2])) indirectLight[2] = 0.0f;
 
 					if (material.blendMode == 0 || material.blendMode == 1) {
-						float indirectBrdf[3];
+						float indirectBrdf[3], diffuseBrdf[3];
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 						float NdotL_indirect = fmaxf(0.0f, dot3(surfaceNormal, indirectDir));
 
-						EvaluatePBRMaterial(albedo, surfaceNormal, wo, indirectDir, metallic, roughness, specularBoost, specColor, indirectBrdf);
+						EvaluatePBRMaterial(albedo, surfaceNormal, wo, indirectDir, metallic, roughness, specularBoost,
+							specColor, indirectBrdf, diffuseBrdf);
 
 						float indirectScale = NdotL_indirect / (indirectProb * indirectPdf);
 						if (indirectScale > 10.0f) indirectScale = 10.0f;
@@ -854,6 +874,13 @@ __global__ void PathTracingKernel(
 						pathRadiance[0] += pathThroughput[0] * indirectLight[0] * indirectBrdf[0] * indirectScale * alphaScale;
 						pathRadiance[1] += pathThroughput[1] * indirectLight[1] * indirectBrdf[1] * indirectScale * alphaScale;
 						pathRadiance[2] += pathThroughput[2] * indirectLight[2] * indirectBrdf[2] * indirectScale * alphaScale;
+						if (sampleGuide.depth > 0.0f) {
+							for (int c = 0; c < 3; c++) {
+								const float incoming = pathThroughput[c] * indirectLight[c] * indirectScale * alphaScale;
+								sampleDiffuse[c] += incoming * diffuseBrdf[c];
+								sampleSpecular[c] += incoming * (indirectBrdf[c] - diffuseBrdf[c]);
+							}
+						}
 					} else {
 						float indirectBrdf[3];
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
@@ -935,16 +962,25 @@ __global__ void PathTracingKernel(
 			if (pdf < 1e-6f) break;
 
 			// update throughput with PBR BRDF
-			float brdf[3];
+			float brdf[3], diffuseBrdf[3] = {};
 			float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 			float NdotL_bounce = fmaxf(0.0f, dot3(surfaceNormal, nextDir));
 
 			if (material.blendMode == 0 || material.blendMode == 1) {
-				EvaluatePBRMaterial(albedo, surfaceNormal, wo, nextDir, metallic, roughness, specularBoost, specColor, brdf);
+				EvaluatePBRMaterial(albedo, surfaceNormal, wo, nextDir, metallic, roughness, specularBoost, specColor,
+					brdf, diffuseBrdf);
 			} else {
 				EvaluateMaterial(albedo, surfaceNormal, wo, nextDir, brdf);
 			}
 
+			if (sampleGuide.depth > 0.0f && depth == 1) {
+				splitIndirect = true;
+				for (int c = 0; c < 3; c++) {
+					diffuseFraction[c] = brdf[c] > 0.0f ? fminf(1.0f, diffuseBrdf[c] / brdf[c]) : 0.0f;
+					indirectBaseline[c] = pathRadiance[c];
+					volumeBaseline[c] = volumeRadiance[c];
+				}
+			}
 			pathThroughput[0] *= brdf[0] * NdotL_bounce / pdf;
 			pathThroughput[1] *= brdf[1] * NdotL_bounce / pdf;
 			pathThroughput[2] *= brdf[2] * NdotL_bounce / pdf;
@@ -973,6 +1009,16 @@ __global__ void PathTracingKernel(
 		color[0] += pathRadiance[0];
 		color[1] += pathRadiance[1];
 		color[2] += pathRadiance[2];
+		for (int c = 0; c < 3; c++) {
+			if (splitIndirect) {
+				const float bounced = fmaxf(0.0f, (pathRadiance[c] - indirectBaseline[c])
+					- (volumeRadiance[c] - volumeBaseline[c]));
+				sampleDiffuse[c] += bounced * diffuseFraction[c];
+				sampleSpecular[c] += bounced * (1.0f - diffuseFraction[c]);
+			}
+			diffuseColor[c] += sampleDiffuse[c];
+			specularColor[c] += sampleSpecular[c];
+		}
 		if (guideBuffer) {
 			if (sample == 0) {
 				guide = sampleGuide;
@@ -982,11 +1028,17 @@ __global__ void PathTracingKernel(
 					|| fabsf(sampleGuide.depth - guide.depth) > fmaxf(0.01f, guide.depth * 0.02f)) {
 					guide.depth = 0.0f;
 					guide.historyValid = 0;
+					guide.coverage = PT_DENOISE_MIXED;
 				} else {
-					for (int c = 0; c < 3; c++) guide.albedo[c] += sampleGuide.albedo[c];
+					for (int c = 0; c < 3; c++) {
+						guide.albedo[c] += sampleGuide.albedo[c];
+						guide.specularAlbedo[c] += sampleGuide.specularAlbedo[c];
+						guide.shadingNormal[c] += sampleGuide.shadingNormal[c];
+					}
+					guide.roughness += sampleGuide.roughness;
 					guide.historyValid &= sampleGuide.historyValid;
 				}
-			}
+			} else if (sampleGuide.depth > 0.0f || sampleGuide.coverage != guide.coverage) guide.coverage = PT_DENOISE_MIXED;
 		}
 
 	}  // end sample loop
@@ -995,6 +1047,7 @@ __global__ void PathTracingKernel(
 	color[0] /= (float)samplesPerPixel;
 	color[1] /= (float)samplesPerPixel;
 	color[2] /= (float)samplesPerPixel;
+	float unclampedColor[3] = { color[0], color[1], color[2] };
 
 	// firefly clamp
 	if (fireflyClamp > 0.0f) {
@@ -1011,9 +1064,26 @@ __global__ void PathTracingKernel(
 		for (int c = 0; c < 3; c++) radianceBuffer[pixelIndex + c] = color[c];
 		radianceBuffer[pixelIndex + 3] = 1.0f;
 	}
+	for (int c = 0; c < 3; c++) {
+		const float scale = isfinite(unclampedColor[c]) && unclampedColor[c] > 0.0f
+			? color[c] / (unclampedColor[c] * samplesPerPixel) : 0.0f;
+		const float diffuse = fminf(color[c], fmaxf(0.0f, diffuseColor[c] * scale));
+		const float specular = fminf(fmaxf(0.0f, color[c] - diffuse), fmaxf(0.0f, specularColor[c] * scale));
+		if (diffuseBuffer) diffuseBuffer[pixelIndex + c] = diffuse;
+		if (specularBuffer) specularBuffer[pixelIndex + c] = specular;
+	}
+	if (diffuseBuffer) diffuseBuffer[pixelIndex + 3] = 1.0f;
+	if (specularBuffer) specularBuffer[pixelIndex + 3] = 1.0f;
 	if (guideBuffer) {
 		if (guide.depth > 0.0f) {
-			for (int c = 0; c < 3; c++) guide.albedo[c] /= samplesPerPixel;
+			for (int c = 0; c < 3; c++) {
+				guide.albedo[c] /= samplesPerPixel;
+				guide.specularAlbedo[c] /= samplesPerPixel;
+			}
+			guide.roughness /= samplesPerPixel;
+			guide.coverage = guide.historyValid ? PT_DENOISE_STATIC : PT_DENOISE_DYNAMIC;
+			if (dot3(guide.shadingNormal, guide.shadingNormal) > 1e-6f) normalize3(guide.shadingNormal);
+			else for (int c = 0; c < 3; c++) guide.shadingNormal[c] = guide.normal[c];
 		}
 		guideBuffer[y * width + x] = guide;
 	}

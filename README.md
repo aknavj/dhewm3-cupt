@@ -70,7 +70,7 @@ and all GUI drawing on top of the 3D view.
   engine pointers are reused
 - **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
 - **SVGF denoising**: illumination demodulation, camera reprojection, temporal luminance
-  moments, variance-guided multi-scale atrous filtering, and albedo restoration before tone mapping
+  moments, separate diffuse/specular filtering, and reflectance restoration before tone mapping
 - **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
 
 ### Denoising
@@ -80,41 +80,81 @@ The CUDA denoiser implements a practical SVGF core inspired by
 not a full port of Q2VKPT's adaptive A-SVGF pipeline:
 
 1. Trace fresh per-frame HDR samples alongside the untouched progressive mean. Keep
-   world position, shading normal, camera-forward depth, material identity, and bounded
-   primary albedo as guides, without additional guide rays. Average modulation color
+   world position, unperturbed and shading normals, camera-forward depth, material identity,
+   roughness, and bounded diffuse/specular reflectance as guides, without additional guide rays. Average modulation color
    across samples; bypass pixels whose samples disagree on the primary surface.
-2. Divide eligible radiance by primary albedo, reproject static-world history through
-   the previous camera, and reject incompatible depth, normals, materials, or albedo.
+2. Separate surface-scattered diffuse and specular transport at the primary BRDF,
+   including indirect bounces, without changing raw transport or random draws.
+   Demodulate each signal separately, reproject static-world history through the
+   previous camera, and reject incompatible depth, normals, materials, or reflectance.
+   Specular history additionally checks shading normals, roughness, and view direction.
 3. Accumulate luminance moments and bounded temporal history (up to 32 frames, with
    a minimum new-color weight of 0.08). Bootstrap variance from the spatial neighborhood
    for new/disoccluded pixels. Neighborhood clipping and lighting-change rejection
    limit stale history, but are not the correlated temporal gradients of A-SVGF.
+   Specular history is shorter (4-24 frames depending on roughness), with a larger
+   minimum new-color weight for smooth highlights.
 4. Run four variance-guided atrous passes at pixel spacings 1, 2, 4, and 8. Retain the
-   first-pass illumination as feedback, then restore current albedo for display.
+   first-pass illumination as feedback, then restore current reflectance for display.
+   Specular spacing is capped by roughness and its shading-normal guidance is stronger.
+   Add primary emission and volumetric scattering back as unfiltered residuals.
 
 Enabled by default in path tracing mode only. `r_ptDenoise 0` displays the raw progressive
 mean; `r_ptDenoiseStrength` adjusts the variance-guided luminance sigma. Denoising uses
 fresh samples, not the already averaged raw buffer, so it remains responsive while moving.
 `r_ptAccumulation` controls the raw progressive mean independently of SVGF history.
-Use `r_ptDenoise 0` for progressively converged reference captures with `r_ptCompare`
-or `r_ptSequence`; with denoising enabled they capture the bounded-history SVGF result.
+Use `r_ptDenoise 0` and `r_ptDenoiseDebug 0` for progressively converged reference captures with `r_ptCompare`
+or `r_ptSequence`. These tools use an offline progressive path: full configured tracing
+quality from the first frame, running diffuse/specular means and variance of the mean,
+averaged surface guides, and spatial denoising of the accumulated signals. They do not
+use the real-time history caps or lighting-change clipping. Emission and volumetric
+residuals come from the full progressive mean too, so fresh fog noise cannot overwrite
+an otherwise converged capture. Each cinematic tick resets this accumulation; screenshot
+redraws reuse the completed result instead of adding extra samples.
+The camera, geometry, materials and lights are snapshotted for each captured tick, so
+render-time animation cannot perturb or repeatedly reset the progressive estimate.
+`r_ptDenoise 1` filters the progressive capture; `0` keeps it an unfiltered reference.
+Real-time volumetrics remain unfiltered and may still look noisy while playing.
 
 Camera movement resets the raw mean without automatically throwing away reprojectable
 history. Explicit resets, resolution/backend/texture changes, trace-setting changes,
-configured scene invalidations, and camera cuts invalidate denoiser history. Changing
+strict scene invalidations (`r_ptResetOnSceneChange 2`), and camera cuts invalidate denoiser history.
+The default scene policy (`1`) still resets the raw mean on structure-count changes,
+but preserves denoiser history subject to per-pixel validation. This prevents particles
+and visibility changes from repeatedly discarding valid static-world history. Changing
 exposure or gamma, or toggling denoising, does not alter the raw accumulation.
 
 This stage has no object motion vectors: non-world/deforming surfaces and view weapons
 receive spatial filtering only, never temporal reuse. Sky, transparent, ambient-only,
-no-shadows, emissive, glossy (roughness below 0.4), and metallic (metallicity at least 0.2)
-primary surfaces bypass denoising. Eligible rough surfaces use combined radiance
-demodulation, not separate diffuse/specular signal channels. Adaptive gradient sampling,
-specular/transmission denoising, and TAA remain future work; low-sample silhouettes
-can still shimmer. Bypassed pixels display the raw progressive mean, so static glossy
-and emissive surfaces can still converge.
+no-shadow overlays, and mixed-primary-surface pixels bypass denoising. Opaque glossy,
+metallic, and emissive surfaces now participate; primary emission itself is not filtered.
+Adaptive gradient sampling, object motion vectors, transmission/volumetric denoising,
+and TAA remain future work; low-sample silhouettes can still shimmer, sharp reflections
+can remain noisy, and moving objects are spatial-only. Bypassed pixels display the raw
+progressive mean.
 
-Denoiser storage is allocated lazily at the trace resolution: 208 additional bytes per
-pixel (about 103 MiB at 960x540), rather than at full window resolution.
+Denoiser storage is allocated lazily at the trace resolution: 384 additional bytes per
+pixel (about 190 MiB at 960x540), rather than at full window resolution.
+
+#### Denoising diagnostics
+
+`r_ptDenoiseDebug` enables the denoiser even when `r_ptDenoise` is off. Return it to
+`0` for normal beauty/raw comparisons. Modes 1-4 bypass exposure, gamma, and tone mapping;
+modes 5-6 show only the filtered HDR signal through normal tone mapping.
+
+| Mode | Display |
+|---|---|
+| `1` | Coverage: green static, yellow dynamic/spatial-only, red transparent, magenta overlay/ambient, orange mixed, black miss |
+| `2` | History length: red = one frame, green = 32 frames; shorter specular caps will not reach full green |
+| `3` | Relative noise: compressed standard deviation divided by luminance; brighter means noisier |
+| `4` | History rejection reason (palette below) |
+| `5` | Filtered diffuse only, without emission/volume |
+| `6` | Filtered specular only, without emission/volume |
+
+`r_ptDenoiseDebugSignal 0` selects diffuse and `1` specular for modes 2-4.
+Rejection colors: green reused, magenta global reset, yellow dynamic/no motion,
+blue offscreen, red depth/disocclusion, cyan normal/view change, orange material,
+purple reflectance/roughness, white lighting change, gray missing samples, black unsupported.
 
 Generated area lights share a target budget of 512 lights with engine light stages. Engine
 light stages take priority and can grow beyond that budget; any emissive triangles that do
@@ -157,11 +197,12 @@ It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is
 
 For the GPU denoising regression test, configure with `-DPT_CUDA_DENOISING_TESTS=ON`,
 build `pt_cuda_denoising_test`, and run `ctest -R pt_cuda_denoising --output-on-failure`.
-It checks noise reduction, temporal reuse and bounded history, camera reprojection,
+It checks diffuse/specular noise reduction, temporal reuse and roughness-dependent bounded history, camera reprojection,
 disocclusion/lighting-change rejection, texture restoration, edge preservation, small/odd
-image sizes, and tone-mapped output. It skips if no CUDA device or driver is available.
+image sizes, diagnostic palettes, signal-only output, and tone-mapped output. It skips if no CUDA device or driver is available.
 The lighting regression test also checks guide eligibility, multi-sample guide generation,
-fresh radiance independent of the progressive mean, and unchanged raw accumulation.
+fresh radiance independent of the progressive mean, unchanged raw accumulation, and
+diffuse/specular conservation for direct, indirect, emissive, clamped, and volumetric cases.
 
 ## Console Commands
 
@@ -173,6 +214,14 @@ fresh radiance independent of the progressive mean, and unchanged raw accumulati
 | `r_ptSequence <start> <end> [frames]` | Path trace a range of demo frames to screenshots |
 | `r_ptAbort` | Abort `r_ptCompare` / `r_ptSequence` |
 | `r_glSequence` / `r_glAbort` | OpenGL counterpart of `r_ptSequence` (always available) |
+
+To capture Enpro from startup, append `+map game/enpro +r_ptSequence 200 1460 128`
+to the engine command line. The sequence waits for the main 3D view, advances 200
+game ticks from the loaded state using OpenGL, then freezes each tick while tracing.
+Loading screens, GUI/subviews, and screenshot redraws do not advance the PT sequence.
+Frames are relative to the state where capture starts; the command does not reload or
+rewind an already running map. Images are written to `screenshots/ptseq_00200.*` through
+`ptseq_01460.*` under the game's save path. `r_ptAbort` cancels and restores capture settings.
 
 The comparison and sequence targets count accumulated frames, not individual samples per pixel;
 the `_spp` suffix in screenshot filenames is historical.
@@ -196,6 +245,38 @@ colour, or other artistic controls. High and Ultra can be substantially slower; 
 quality ramp still reduces samples and bounces for the first few frames after movement or a
 reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
 
+### Enpro lighting/look profile
+
+For a clearer, brighter path-traced `game/enpro`, load the opt-in profile shipped
+in [`neo/base/pt_enpro.cfg`](neo/base/pt_enpro.cfg):
+
+```
+exec pt_enpro.cfg
+map game/enpro
+```
+
+The config must be in the game's `base` search path; copy it there if your Doom 3
+data lives outside `neo/base`. It does not load a map or teleport the player itself.
+The reference viewpoint is:
+
+```
+setviewpos -1177.94 3760.25 -155.75 131.5
+```
+
+This uses High quality and SVGF, raises exposure to 2.2 and emissive lighting to 2,
+nudges `r_lightScale` from 2 to 2.2, and reduces specular boost to 1 to balance hot
+highlights. It keeps ACES and gamma 2.2, uses gentler low-throughput roulette for
+cleaner indirect estimates, and disables volumetric density to remove the noisy
+haze. The sky is deliberately unchanged: `r_ptSkyIntensity` only affects primary
+misses and does not light the room.
+
+The look is opt-in and does not change renderer defaults or map assets. `seta`
+values persist in your saved configuration; `r_lightScale` is session-only and
+also affects OpenGL, so restore it to 2 when comparing against stock lighting.
+For more speed, select `r_ptPreset med` after executing the config; the artistic
+settings remain. This is a lighting balance, not a relit map: fully unlit areas
+still need actual lights or emissive geometry to receive illumination.
+
 ## Console Variables
 
 | CVar | Default | Description |
@@ -217,13 +298,15 @@ reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
 | `r_ptThroughputClamp` | `0.25` | Russian roulette for paths below this throughput after shading (0–1, unbiased) |
 | `r_ptFireflyClamp` | `5.0` | Clamp per-sample radiance (0 = off) |
 | `r_ptAccumulation` | `1` | Accumulate samples while the view is static |
-| `r_ptResetOnSceneChange` | `1` | Restart accumulation on scene changes: 0 = camera only, 1 = objects/lights appearing or vanishing, 2 = any change incl. animation (may never converge) |
+| `r_ptResetOnSceneChange` | `1` | Scene resets: 0 = none, 1 = raw mean on structure changes with per-pixel denoiser validation, 2 = raw mean and denoiser on any content change |
 | `r_ptRayOffset` | `0.001` | Ray origin offset against self-intersection |
 | `r_ptEmissionBoost` | `1.0` | Emission multiplier |
 | `r_ptSpecularBoost` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
 | `r_ptSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard shadows) |
 | `r_ptDenoise` | `1` | SVGF temporal/variance-guided denoising in path tracing mode only |
 | `r_ptDenoiseStrength` | `0.5` | Variance-guided luminance sigma scale (0.05–4); higher values smooth more |
+| `r_ptDenoiseDebug` | `0` | 0 beauty, 1 coverage, 2 history, 3 relative noise, 4 rejection, 5 diffuse, 6 specular |
+| `r_ptDenoiseDebugSignal` | `0` | Signal for diagnostics 2-4: 0 diffuse, 1 specular |
 | `r_ptExposure` | `1.0` | Exposure multiplier |
 | `r_ptGamma` | `2.2` | Output gamma, textures and colors are decoded with 2.2 |
 | `r_ptToneMapMode` | `1` | 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |

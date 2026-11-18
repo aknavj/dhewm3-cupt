@@ -175,13 +175,15 @@ __device__ void EvaluatePBRMaterial(
 	float roughness,
 	float specularBoost,  // Doom 3 interaction shader doubles specular
 	const float* specColor,  // specular tint from specular map
-	float* brdf
+	float* brdf,
+	float* diffuseBrdf = NULL
 ) {
 	float NdotL = fmaxf(0.0f, dot3(normal, wi));
 	float NdotV = fmaxf(0.0f, dot3(normal, wo));
 
 	if (NdotL <= 0.0f || NdotV <= 0.0f) {
 		brdf[0] = brdf[1] = brdf[2] = 0.0f;
+		if (diffuseBrdf) diffuseBrdf[0] = diffuseBrdf[1] = diffuseBrdf[2] = 0.0f;
 		return;
 	}
 
@@ -234,6 +236,9 @@ __device__ void EvaluatePBRMaterial(
 	brdf[0] = diff[0] + specular[0];
 	brdf[1] = diff[1] + specular[1];
 	brdf[2] = diff[2] + specular[2];
+	if (diffuseBrdf) {
+		for (int c = 0; c < 3; c++) diffuseBrdf[c] = diff[c];
+	}
 }
 
 #endif // __CU_RENDERER_MATERIAL_CUH__

@@ -283,7 +283,8 @@ static std::vector<float> Helpers(fixture_t& fixture) {
 }
 
 static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, float indirectProb, float emissionBoost,
-	float expectedGuideDepth = 1.0f, int expectedHistoryValid = 1, int samplesPerPixel = 1) {
+	float expectedGuideDepth = 1.0f, int expectedHistoryValid = 1, int samplesPerPixel = 1,
+	float fireflyClamp = 0.0f, float volDensity = 0.0f, double* meanResidual = NULL) {
 	fixture.Upload();
 	ptRenderParams_t params = {};
 	params.camPos[2] = 1.0f;
@@ -297,6 +298,10 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	params.indirectProb = indirectProb;
 	params.rayOffset = 0.0001f;
 	params.emissionBoost = emissionBoost;
+	params.specularBoost = 1.0f;
+	params.fireflyClamp = fireflyClamp;
+	params.volDensity = volDensity;
+	params.volSteps = 8;
 
 	const int pixels = params.width * params.height;
 	float* d_framebuffer = Allocate<float>(pixels * 4);
@@ -310,20 +315,49 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	CUDA_CHECK(cudaMemcpy(framebuffer.data(), d_framebuffer, framebuffer.size() * sizeof(float), cudaMemcpyDeviceToHost));
 	ptCudaDenoiseGuide_t* d_guide = Allocate<ptCudaDenoiseGuide_t>(pixels);
 	float* d_radiance = Allocate<float>(pixels * 4);
+	float* d_diffuse = Allocate<float>(pixels * 4);
+	float* d_specular = Allocate<float>(pixels * 4);
 	CUDA_CHECK(cudaMemset(d_guide, 0xff, pixels * sizeof(ptCudaDenoiseGuide_t)));
 	CUDA_CHECK(cudaMemset(d_framebuffer, 0, pixels * 4 * sizeof(float)));
 	PathTracingKernel<<<grid, block>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_node, fixture.d_indices,
-		fixture.d_materials, fixture.d_textures, fixture.d_lights, 1, d_framebuffer, params, d_radiance, d_guide);
+		fixture.d_materials, fixture.d_textures, fixture.d_lights, 1, d_framebuffer, params, d_radiance, d_guide,
+		d_diffuse, d_specular);
 	CUDA_CHECK(cudaGetLastError());
 	std::vector<float> guided(pixels * 4), radiance(pixels * 4);
+	std::vector<float> diffuse(pixels * 4), specular(pixels * 4);
 	std::vector<ptCudaDenoiseGuide_t> guide(pixels);
 	CUDA_CHECK(cudaMemcpy(guided.data(), d_framebuffer, guided.size() * sizeof(float), cudaMemcpyDeviceToHost));
 	CUDA_CHECK(cudaMemcpy(guide.data(), d_guide, guide.size() * sizeof(ptCudaDenoiseGuide_t), cudaMemcpyDeviceToHost));
 	CUDA_CHECK(cudaMemcpy(radiance.data(), d_radiance, radiance.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(diffuse.data(), d_diffuse, diffuse.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	CUDA_CHECK(cudaMemcpy(specular.data(), d_specular, specular.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	double residualTotal = 0.0;
 	for (int i = 0; i < pixels * 4; i++) {
 		CheckNear("guide generation preserves radiance", guided[i], framebuffer[i], 0.0);
 		CheckNear("fresh radiance", radiance[i], framebuffer[i], 0.0);
+		if (i % 4 != 3) {
+			if (fireflyClamp > 0.0f && radiance[i] > fireflyClamp) {
+				std::fprintf(stderr, "Firefly clamp exceeded at %d\n", i);
+				std::exit(1);
+			}
+			if (i % 4 == 0) residualTotal += radiance[i] - diffuse[i] - specular[i];
+			if (!std::isfinite(diffuse[i]) || !std::isfinite(specular[i]) || diffuse[i] < 0.0f || specular[i] < 0.0f
+				|| diffuse[i] + specular[i] > radiance[i] + 1e-5f) {
+				std::fprintf(stderr, "Invalid diffuse/specular decomposition at %d\n", i);
+				std::exit(1);
+			}
+			if (expectedGuideDepth > 0.0f && volDensity == 0.0f) {
+				const float emission = fixture.materials[1].emission[i % 4] * emissionBoost;
+				CheckNear("surface signals plus primary emission conserve radiance", diffuse[i] + specular[i] + emission,
+					radiance[i], 2e-5);
+				if (fixture.materials[1].metallic == 1.0f) CheckNear("metal has no diffuse signal", diffuse[i], 0.0, 0.0);
+			}
+		} else {
+			CheckNear("diffuse alpha initialized", diffuse[i], 1.0, 0.0);
+			CheckNear("specular alpha initialized", specular[i], 1.0, 0.0);
+		}
 	}
+	if (meanResidual) *meanResidual = residualTotal / pixels;
 	for (int i = 0; i < pixels; i++) {
 		CheckNear("first surface guide depth", guide[i].depth, expectedGuideDepth, 1e-6);
 		const double normalLength = guide[i].normal[0] * guide[i].normal[0]
@@ -333,7 +367,9 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 		if (expectedGuideDepth > 0.0f) {
 			CheckNear("guide world position", guide[i].position[2], 0.0, 1e-6);
 			CheckNear("guide material", guide[i].materialIndex, 1, 0.0);
-			CheckNear("guide modulation color", guide[i].albedo[0], fixture.materials[1].albedo[0], 1e-6);
+			CheckNear("guide modulation color", guide[i].albedo[0],
+				fmaxf(0.04f, fixture.materials[1].albedo[0] * (1.0f - fixture.materials[1].metallic)), 1e-6);
+			CheckNear("coverage classification", guide[i].coverage, expectedHistoryValid ? PT_DENOISE_STATIC : PT_DENOISE_DYNAMIC, 0.0);
 		}
 	}
 	std::vector<float> accumulated(pixels * 4, 0.25f);
@@ -350,6 +386,8 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	}
 	CUDA_CHECK(cudaFree(d_guide));
 	CUDA_CHECK(cudaFree(d_radiance));
+	CUDA_CHECK(cudaFree(d_diffuse));
+	CUDA_CHECK(cudaFree(d_specular));
 	CUDA_CHECK(cudaFree(d_framebuffer));
 	double total = 0.0;
 	for (int i = 0; i < pixels; i++) total += framebuffer[i * 4];
@@ -498,18 +536,39 @@ int main() {
 	CheckNear("unrepresented path emitter", TracePath(fixture, 2, 1, 0.0f, 1.0f), direct + bounce, 0.006);
 
 	TracePath(fixture, 2, 1, 0.0f, 1.0f, 1.0f, 1, 4);
+	TracePath(fixture, 2, 1, 0.0f, 1.0f, 1.0f, 1, 4, 0.01f);
 	fixture.triangles[1].flags |= PT_TRI_NO_HISTORY;
 	TracePath(fixture, 1, 1, 0.0f, 1.0f, 1.0f, 0);
 	fixture.triangles[1].flags &= ~PT_TRI_NO_HISTORY;
 	fixture.materials[1].roughness = 0.1f;
-	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	TracePath(fixture, 1, 1, 0.0f, 1.0f);
 	fixture.materials[1].roughness = 1.0f;
 	fixture.materials[1].metallic = 1.0f;
-	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	TracePath(fixture, 1, 1, 0.0f, 1.0f);
 	fixture.materials[1].metallic = 0.0f;
 	fixture.materials[1].emission[0] = 0.1f;
-	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
+	TracePath(fixture, 1, 1, 0.0f, 1.0f);
 	fixture.materials[1].emission[0] = 0.0f;
+	const ptLight_t areaLight = fixture.lights[0];
+	fixture.lights[0] = {};
+	fixture.lights[0].type = PT_LIGHT_POINT;
+	fixture.lights[0].position[2] = 1.5f;
+	fixture.lights[0].intensity = 1.0f;
+	fixture.lights[0].radius = 10.0f;
+	fixture.lights[0].volumetric = 1.0f;
+	fixture.lights[0].textureIndex = -1;
+	fixture.lights[0].projectedTextureIndex = -1;
+	fixture.lights[0].falloffTextureIndex = -1;
+	for (int c = 0; c < 3; c++) fixture.lights[0].color[c] = 1.0f;
+	const double withoutVolume = TracePath(fixture, 1, 1, 0.0f, 1.0f);
+	double volumeResidual = 0.0;
+	const double withVolume = TracePath(fixture, 1, 1, 0.0f, 1.0f, 1.0f, 1, 1, 0.0f, 0.1f, &volumeResidual);
+	CheckNear("volume is entirely retained in the unfiltered residual", withVolume - withoutVolume, volumeResidual, 1e-5);
+	if (volumeResidual <= 0.0001) {
+		std::fprintf(stderr, "Volume regression must exercise nonzero scattering\n");
+		return 1;
+	}
+	fixture.lights[0] = areaLight;
 	fixture.materials[1].transmission = 1.0f;
 	TracePath(fixture, 1, 1, 0.0f, 1.0f, 0.0f);
 	fixture.materials[1].transmission = 0.0f;

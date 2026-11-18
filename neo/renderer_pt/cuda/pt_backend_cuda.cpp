@@ -361,10 +361,14 @@ bool idPathTracerBackendCUDA::Resize( int width, int height ) {
 void idPathTracerBackendCUDA::FreeDenoiser() {
 	cudaFree( denoiser.radiance );
 	cudaFree( denoiser.scratch );
+	cudaFree( denoiser.filteredDiffuse );
 	for ( int i = 0; i < 2; i++ ) {
 		cudaFree( denoiser.guides[i] );
-		cudaFree( denoiser.history[i] );
-		cudaFree( denoiser.moments[i] );
+		cudaFree( denoiser.signals[i].radiance );
+		for ( int slot = 0; slot < 2; slot++ ) {
+			cudaFree( denoiser.signals[i].history[slot] );
+			cudaFree( denoiser.signals[i].moments[slot] );
+		}
 	}
 	cudaFree( d_filtered );
 	d_filtered = NULL;
@@ -382,11 +386,15 @@ bool idPathTracerBackendCUDA::ResizeDenoiser( int width, int height ) {
 	const size_t colorBytes = pixels * 4 * sizeof( float );
 	PT_CUDA_CHECK( cudaMalloc( &denoiser.radiance, colorBytes ) );
 	PT_CUDA_CHECK( cudaMalloc( &denoiser.scratch, colorBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &denoiser.filteredDiffuse, colorBytes ) );
 	PT_CUDA_CHECK( cudaMalloc( &d_filtered, colorBytes ) );
 	for ( int i = 0; i < 2; i++ ) {
 		PT_CUDA_CHECK( cudaMalloc( &denoiser.guides[i], pixels * sizeof( ptCudaDenoiseGuide_t ) ) );
-		PT_CUDA_CHECK( cudaMalloc( &denoiser.history[i], colorBytes ) );
-		PT_CUDA_CHECK( cudaMalloc( &denoiser.moments[i], colorBytes ) );
+		PT_CUDA_CHECK( cudaMalloc( &denoiser.signals[i].radiance, colorBytes ) );
+		for ( int slot = 0; slot < 2; slot++ ) {
+			PT_CUDA_CHECK( cudaMalloc( &denoiser.signals[i].history[slot], colorBytes ) );
+			PT_CUDA_CHECK( cudaMalloc( &denoiser.signals[i].moments[slot], colorBytes ) );
+		}
 	}
 	denoiseWidth = width;
 	denoiseHeight = height;
@@ -606,6 +614,7 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	// debug modes overwrite the buffer every frame, only path tracing accumulates
 	const bool accumulate = ( p.renderMode == PT_MODE_PATHTRACE );
+	if ( accumulate && p.captureTargetFrames > 0 && accumFrames >= p.captureTargetFrames ) return true;
 	if ( !accumulate ) {
 		accumFrames = 0;
 	}
@@ -628,7 +637,7 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 
 	cudaEventRecord( timerStart, stream );
 
-	const bool denoise = accumulate && p.denoiseEnabled != 0;
+	const bool denoise = accumulate && ( p.denoiseEnabled != 0 || p.denoiseDebug != 0 );
 	if ( denoise ) {
 		if ( !ResizeDenoiser( p.width, p.height ) ) return false;
 		float forwardDot = 0.0f, cameraDistanceSquared = 0.0f;
@@ -642,7 +651,8 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 		denoiseHistoryValid = false;
 	}
 	LaunchPathTracingKernel( &view, d_accum, denoise ? denoiser.radiance : NULL,
-		denoise ? denoiser.guides[denoiseFrameSlot] : NULL, &p, stream );
+		denoise ? denoiser.guides[denoiseFrameSlot] : NULL,
+		denoise ? denoiser.signals[0].radiance : NULL, denoise ? denoiser.signals[1].radiance : NULL, &p, stream );
 	PT_CUDA_CHECK( cudaGetLastError() );
 
 	accumFrames++;
@@ -652,9 +662,12 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 			denoiseFrameSlot, denoiseHistoryValid ? 1 : 0, stream ) );
 		hdrBuffer = d_filtered;
 	}
-	LaunchToneMappingKernel( hdrBuffer, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode,
-		stream );
-	PT_CUDA_CHECK( cudaGetLastError() );
+	if ( denoise && p.denoiseDebug >= 1 && p.denoiseDebug <= 4 ) {
+		PT_CUDA_CHECK( LaunchDenoisingDebugKernel( &denoiser, d_output, &p, denoiseFrameSlot, stream ) );
+	} else {
+		LaunchToneMappingKernel( hdrBuffer, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode, stream );
+		PT_CUDA_CHECK( cudaGetLastError() );
+	}
 
 	cudaEventRecord( timerStop, stream );
 	PT_CUDA_CHECK( cudaStreamSynchronize( stream ) );
@@ -695,7 +708,7 @@ void idPathTracerBackendCUDA::GetStats( ptBackendStats_t &stats ) const {
 	stats.numTextures = numTextures;
 	stats.deviceBytes = textureBytes
 		+ (size_t)maxWidth * maxHeight * 4 * ( sizeof( float ) + 1 )
-		+ (size_t)denoiseWidth * denoiseHeight * ( 7 * 4 * sizeof( float ) + 2 * sizeof( ptCudaDenoiseGuide_t ) )
+		+ (size_t)denoiseWidth * denoiseHeight * ( 14 * 4 * sizeof( float ) + 2 * sizeof( ptCudaDenoiseGuide_t ) )
 		+ (size_t)capVertices * sizeof( ptVertex_t )
 		+ (size_t)capTriangles * sizeof( ptTriangle_t )
 		+ (size_t)capBVHNodes * sizeof( ptBVHNode_t )

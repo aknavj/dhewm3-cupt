@@ -52,7 +52,7 @@ idCVar r_ptThroughputClamp( "r_ptThroughputClamp", "0.25", CVAR_RENDERER | CVAR_
 
 // accumulation
 idCVar r_ptAccumulation( "r_ptAccumulation", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "accumulate samples over frames while the view is static" );
-idCVar r_ptResetOnSceneChange( "r_ptResetOnSceneChange", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "restart accumulation on scene changes: 0 = camera only, 1 = objects / lights appearing or vanishing, 2 = any change incl. animation (may never converge)", 0, 2 );
+idCVar r_ptResetOnSceneChange( "r_ptResetOnSceneChange", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "scene resets: 0 = none, 1 = raw mean on structure changes (per-pixel denoiser validation), 2 = raw mean and denoiser on any content change", 0, 2 );
 
 // shading
 idCVar r_ptRayOffset( "r_ptRayOffset", "0.001", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "ray origin offset against self intersection", 0.0001f, 0.1f );
@@ -63,6 +63,8 @@ idCVar r_ptSoftShadowScale( "r_ptSoftShadowScale", "0.2", CVAR_RENDERER | CVAR_A
 // display
 idCVar r_ptDenoise( "r_ptDenoise", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL, "SVGF temporal/variance-guided denoising for path tracing (raw accumulation is preserved)" );
 idCVar r_ptDenoiseStrength( "r_ptDenoiseStrength", "0.5", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "SVGF variance-guided luminance sigma scale: higher values smooth more", 0.05f, 4.0f );
+idCVar r_ptDenoiseDebug( "r_ptDenoiseDebug", "0", CVAR_RENDERER | CVAR_INTEGER, "Denoising diagnostics: 0 beauty, 1 coverage, 2 history, 3 relative noise, 4 rejection, 5 diffuse, 6 specular", 0, 6 );
+idCVar r_ptDenoiseDebugSignal( "r_ptDenoiseDebugSignal", "0", CVAR_RENDERER | CVAR_INTEGER, "Signal for history/noise/rejection diagnostics: 0 diffuse, 1 specular", 0, 1 );
 idCVar r_ptExposure( "r_ptExposure", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "exposure multiplier" );
 idCVar r_ptGamma( "r_ptGamma", "2.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "output gamma, textures and colors are decoded with 2.2", 0.1f, 10.0f );
 idCVar r_ptToneMapMode( "r_ptToneMapMode", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "0 = Reinhard, 1 = ACES, 2 = Uncharted 2", 0, 2 );
@@ -451,7 +453,10 @@ static void PT_SetupParams( ptRenderParams_t &p, const viewDef_t *viewDef, int t
 	p.volMaxDist = Max( 0.0f, r_ptVolMaxDist.GetFloat() );
 
 	p.denoiseEnabled = r_ptDenoise.GetBool() ? 1 : 0;
+	p.captureTargetFrames = RB_PT_GetCaptureTargetFrames();
 	p.denoiseStrength = r_ptDenoiseStrength.GetFloat();
+	p.denoiseDebug = r_ptDenoiseDebug.GetInteger();
+	p.denoiseDebugSignal = r_ptDenoiseDebugSignal.GetInteger();
 	p.exposure = Max( 0.001f, r_ptExposure.GetFloat() );
 	p.gamma = r_ptGamma.GetFloat();
 	p.toneMapMode = r_ptToneMapMode.GetInteger();
@@ -492,6 +497,9 @@ static bool PT_TraceSettingsChanged( const ptRenderParams_t &a, const ptRenderPa
 		if ( a.skyZenith[i] != b.skyZenith[i] || a.skyHorizon[i] != b.skyHorizon[i] || a.skyGround[i] != b.skyGround[i] ) return true;
 	}
 	return a.width != b.width || a.height != b.height || a.renderMode != b.renderMode
+		|| a.captureTargetFrames != b.captureTargetFrames
+		|| ( a.captureTargetFrames > 0 && ( a.denoiseEnabled != b.denoiseEnabled
+			|| ( a.denoiseDebug != 0 ) != ( b.denoiseDebug != 0 ) ) )
 		|| a.samplesPerPixel != b.samplesPerPixel || a.maxDepth != b.maxDepth
 		|| a.maxLightSamples != b.maxLightSamples || a.indirectProb != b.indirectProb
 		|| a.rrEnabled != b.rrEnabled || a.rrMinBounces != b.rrMinBounces || a.rrSurvivalMin != b.rrSurvivalMin
@@ -596,24 +604,6 @@ bool RB_PT_DrawView( void ) {
 		return false;
 	}
 
-	// build and upload the scene
-	pt.scene->BeginFrame();
-	for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
-		pt.scene->AddDrawSurface( viewDef->drawSurfs[i] );
-	}
-	for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
-		pt.scene->AddViewLight( vLight );
-	}
-	pt.scene->EndFrame();
-
-	const bool uploaded = pt.backend->UploadScene( *pt.scene );
-	pt.scene->ReleasePendingTextures();
-	if ( !uploaded ) {
-		// a failed upload loses the pending textures, start over with a clean cache
-		pt.scene->Clear();
-		return false;
-	}
-
 	// trace resolution follows the viewport, not the window
 	const int vpWidth = viewDef->viewport.x2 + 1 - viewDef->viewport.x1;
 	const int vpHeight = viewDef->viewport.y2 + 1 - viewDef->viewport.y1;
@@ -628,14 +618,44 @@ bool RB_PT_DrawView( void ) {
 	PT_SetupParams( params, viewDef, traceWidth, traceHeight );
 
 	const float lightScale = Max( 0.0f, r_lightScale.GetFloat() );
+	const bool frozenCapture = params.captureTargetFrames > 0 && pt.havePrev && pt.prevParams.captureTargetFrames > 0
+		&& pt.backend->GetAccumulatedFrames() > 0 && !PT_TraceSettingsChanged( params, pt.prevParams )
+		&& lightScale == pt.prevLightScale;
+	if ( frozenCapture ) {
+		for ( int c = 0; c < 3; c++ ) {
+			params.camPos[c] = pt.prevParams.camPos[c];
+			params.camForward[c] = pt.prevParams.camForward[c];
+			params.camRight[c] = pt.prevParams.camRight[c];
+			params.camUp[c] = pt.prevParams.camUp[c];
+		}
+		params.fovX = pt.prevParams.fovX;
+		params.fovY = pt.prevParams.fovY;
+	} else {
+		// Capture reuses this snapshot until the next cinematic tick resets accumulation.
+		pt.scene->BeginFrame();
+		for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
+			pt.scene->AddDrawSurface( viewDef->drawSurfs[i] );
+		}
+		for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+			pt.scene->AddViewLight( vLight );
+		}
+		pt.scene->EndFrame();
+		const bool uploaded = pt.backend->UploadScene( *pt.scene );
+		pt.scene->ReleasePendingTextures();
+		if ( !uploaded ) {
+			pt.scene->Clear();
+			return false;
+		}
+	}
+
 	bool resetHistory = !pt.havePrev || PT_TraceSettingsChanged( params, pt.prevParams )
 		|| lightScale != pt.prevLightScale;
-	switch ( r_ptResetOnSceneChange.GetInteger() ) {
-		case 2:		resetHistory |= pt.scene->ContentHash() != pt.prevContentHash;		// fall through
-		case 1:		resetHistory |= pt.scene->StructureHash() != pt.prevStructureHash;	break;
-		default:	break;
-	}
-	const bool reset = resetHistory || !r_ptAccumulation.GetBool() || PT_ViewChanged( params, pt.prevParams );
+	const int scenePolicy = r_ptResetOnSceneChange.GetInteger();
+	const bool sceneChanged = ( scenePolicy >= 1 && pt.scene->StructureHash() != pt.prevStructureHash )
+		|| ( scenePolicy == 2 && pt.scene->ContentHash() != pt.prevContentHash );
+	// Visibility/particle counts reset the raw mean, not otherwise valid world-space history.
+	resetHistory |= scenePolicy == 2 && sceneChanged;
+	const bool reset = resetHistory || sceneChanged || !r_ptAccumulation.GetBool() || PT_ViewChanged( params, pt.prevParams );
 	if ( reset ) {
 		pt.backend->ResetAccumulation( resetHistory );
 	}
@@ -645,7 +665,9 @@ bool RB_PT_DrawView( void ) {
 	pt.prevLightScale = lightScale;
 	pt.havePrev = true;
 
-	PT_ApplyProgressiveQuality( params, pt.backend->GetAccumulatedFrames() );
+	if ( !params.captureTargetFrames ) {
+		PT_ApplyProgressiveQuality( params, pt.backend->GetAccumulatedFrames() );
+	}
 
 	if ( !pt.backend->Render( params ) ) {
 		return false;

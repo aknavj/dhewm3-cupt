@@ -168,7 +168,6 @@ enum cuSeqState_t {
 	CUSEQ_SCREENSHOT,
 	CUSEQ_ADVANCE_UNPAUSE,
 	CUSEQ_ADVANCE_WAIT,
-	CUSEQ_ADVANCE_REFREEZE,
 	CUSEQ_DONE
 };
 
@@ -177,12 +176,16 @@ static int cuSeq_frameStart = 0;
 static int cuSeq_frameEnd = 0;
 static int cuSeq_currentFrame = 0;
 static int cuSeq_targetSamples = 256;
-static int cuSeq_waitCounter = 0;
 static int cuSeq_startTime = 0;
 static int cuSeq_saved_fixedTic = 0;
 static bool cuSeq_saved_stopTime = false;
 static bool cuSeq_saved_ptDraw = false;
 static bool cuSeq_saved_accumulation = false;
+
+int RB_PT_GetCaptureTargetFrames( void ) {
+	if (cuSeq_state == CUSEQ_ACCUMULATE || cuSeq_state == CUSEQ_SCREENSHOT) return cuSeq_targetSamples;
+	return cuCmp_state == CUCOMP_WAIT_CU_SAMPLES ? cuCmp_targetSamples : 0;
+}
 
 /*
 ========================
@@ -290,8 +293,7 @@ void RB_PT_SequenceCheck( void ) {
                     stopTimeCVar->SetBool(false);
                 }
                 cuSeq_currentFrame = 0;
-                cuSeq_waitCounter = 0;
-                cuSeq_state = CUSEQ_ADVANCE_UNPAUSE;
+                cuSeq_state = CUSEQ_ADVANCE_WAIT;
                 common->Printf("[cuseq] Fast-forwarding to frame %d using OpenGL renderer...\n", cuSeq_frameStart);
             } else {
                 // start from frame 0 — enable path tracer and freeze immediately
@@ -375,25 +377,14 @@ void RB_PT_SequenceCheck( void ) {
             if (stopTimeCVar) {
                 stopTimeCVar->SetBool(false);
             }
-            cuSeq_waitCounter = 0;
             cuSeq_state = CUSEQ_ADVANCE_WAIT;
             break;
         }
 
         case CUSEQ_ADVANCE_WAIT: 
         {
-            // wait one frame for the game tick to actually execute
-            cuSeq_waitCounter++;
-            if (cuSeq_waitCounter >= 1) {
-                cuSeq_currentFrame++;
-                cuSeq_state = CUSEQ_ADVANCE_REFREEZE;
-            }
-            break;
-        }
-
-        case CUSEQ_ADVANCE_REFREEZE: 
-        {
-            // re-freeze the game
+            // Exactly one fixed game tick has elapsed since unpausing.
+            cuSeq_currentFrame++;
             idCVar* stopTimeCVar = cvarSystem->Find("g_stoptime");
             if (stopTimeCVar) {
                 stopTimeCVar->SetBool(true);
@@ -405,7 +396,10 @@ void RB_PT_SequenceCheck( void ) {
                     common->Printf("[cuseq] Fast-forward (GL): frame %d / %d...\n",
                         cuSeq_currentFrame, cuSeq_frameStart);
                 }
-                cuSeq_state = CUSEQ_ADVANCE_UNPAUSE;
+                if (stopTimeCVar) {
+                    stopTimeCVar->SetBool(false);
+                }
+                cuSeq_state = CUSEQ_ADVANCE_WAIT;
             } else {
                 // we've reached a renderable frame — switch to path tracer and accumulate
                 if (!r_ptDraw.GetBool()) {
@@ -496,6 +490,12 @@ void R_PT_Abort_f(const idCmdArgs& args) {
 	if (cuSeq_state != CUSEQ_IDLE) {
 		common->Printf("[cuseq] Aborting sequence render at frame %d (was in state %d)...\n",
 			cuSeq_currentFrame, (int)cuSeq_state);
+
+		if (cuSeq_state == CUSEQ_SETUP) {
+			cuSeq_state = CUSEQ_IDLE;
+			common->Printf("[cuseq] Cancelled before capture setup; CVars unchanged.\n");
+			return;
+		}
 
 		// restore saved cvar values
 		idCVar* stopTimeCVar = cvarSystem->Find("g_stoptime");
