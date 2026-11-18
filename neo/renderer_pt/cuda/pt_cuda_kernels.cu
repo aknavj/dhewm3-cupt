@@ -8,6 +8,14 @@
 #include "renderer_pt/cuda/pt_kernel_triangles_raytraced.cuh"
 #include "renderer_pt/cuda/pt_kernel_pathtracing.cuh"
 #include "renderer_pt/cuda/pt_kernel_denoising.cuh"
+#include "renderer_pt/cuda/pt_cuda_postprocess.cuh"
+
+extern "C" cudaError_t LaunchPostprocessKernel( const ptCudaPostprocessBuffers_t *buffers, const float *hdr,
+											  const ptRenderParams_t *params, cudaStream_t stream ) {
+	const ptRenderParams_t &p = *params;
+	return PT_Postprocess( *buffers, hdr, p.width, p.height, p.exposure, p.bloomThreshold,
+		p.bloomRadius, p.bloomStrength, p.lensFlareStrength, stream );
+}
 
 /*
 ========================

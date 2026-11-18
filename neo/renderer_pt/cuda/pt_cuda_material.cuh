@@ -215,11 +215,13 @@ __device__ void EvaluatePBRMaterial(
 	const float* specColor,  // specular tint from specular map
 	float* brdf,
 	float* diffuseBrdf = NULL,
-	const ptRenderParams_t* params = NULL
+	const ptRenderParams_t* params = NULL,
+	float materialIor = 0.0f
 ) {
 #ifdef PT_PHYSICAL
 	if (PT_PhysicalActive(params)) {
-		PT_EvaluatePhysicalMaterial(albedo, normal, wo, wi, metallic, roughness, params->physicalIor, brdf, diffuseBrdf);
+		PT_EvaluatePhysicalMaterial(albedo, normal, wo, wi, metallic, roughness,
+			materialIor > 0.0f ? materialIor : params->physicalIor, brdf, diffuseBrdf);
 		return;
 	}
 #endif

@@ -290,11 +290,12 @@ approximations; the calibration controls set their assumed physical scale.
 Placed point lights are ideal point sources (hard shadows); actual emissive
 triangles provide area-light soft shadows. Existing transparent/additive overlays,
 straight-through glass, geometry visibility/portal extraction, output gamma and
-tone mappers remain approximations inherited from the renderer. Surfaces outside
+tone mappers remain approximations inherited from the renderer unless explicitly
+overridden by a `ptMaterial` block (below). Surfaces outside
 the engine's extracted scene cannot reflect or occlude light. The physical lens
 overrides gameplay FOV, so this mode is especially suited to cinematic work.
-Shutter time does not provide motion blur. Participating media are not yet modeled:
-legacy volumetrics are disabled, as are artistic light/specular/emission boosts,
+Shutter time does not provide motion blur. Legacy volumetrics are disabled,
+as are artistic light/specular/emission boosts,
 the legacy single-bounce GI shortcut and biased radiance/firefly clamps.
 `r_ptSkyIntensity`, if enabled, is interpreted as environment luminance and
 illuminates secondary misses too; it is no longer only a backdrop.
@@ -305,6 +306,96 @@ It checks exposure stops, lens units/FOV/focus and aperture distribution,
 inverse-square lighting and selection beyond old light volumes, unclamped direct
 light, spotlight normalization, BRDF reciprocity, and Monte Carlo energy bounds
 for diffuse/metallic materials from polished to rough and normal to grazing views.
+
+#### HDR bloom and lens ghosts
+
+These display effects work in both CUDA builds and default **off**. They operate on
+the denoised scene-linear HDR image before exposure/tone mapping, never on the raw
+accumulation or denoiser history. Changing their controls does not restart convergence.
+All denoiser diagnostic views bypass them.
+
+| CVar | Default | Meaning |
+|---|---|---|
+| `r_ptBloom` | `0` | Bloom strength, 0 to 1 |
+| `r_ptBloomThreshold` | `1` | Highlight threshold in exposed linear units |
+| `r_ptBloomRadius` | `0.025` | Blur radius as a fraction of image height |
+| `r_ptLensFlare` | `0` | Screen-space lens ghost strength, 0 to 1 |
+
+Try `r_ptBloom 0.08` and optionally `r_ptLensFlare 0.02`. The threshold follows
+photographic exposure. A downsampled separable filter keeps the effect inexpensive.
+Lens ghosts use visible highlights only; they are an artistic approximation, not
+an optical lens simulation, and do not invent flares from hidden lights.
+The physical ImGui panel exposes these controls.
+
+#### Physical single scattering
+
+`PT_PHYSICAL` adds a separate homogeneous participating medium. It includes
+Beer-Lambert extinction on view/bounce/light segments, colored visibility shadows,
+Henyey-Greenstein scattering, photometric engine lights, and sampled emissive lights.
+The finite volume is explicitly a **camera-centered sphere**, not map-authored fog;
+moving the camera moves its boundary. There is no multiple scattering.
+
+| CVar | Default | Meaning |
+|---|---|---|
+| `r_ptPhysicalFogDensity` | `0` | Extinction in inverse meters; 0 disables the medium |
+| `r_ptPhysicalFogAlbedo` | `0.9` | Scattering/extinction ratio; 0 gives pure absorption |
+| `r_ptPhysicalFogAnisotropy` | `0.3` | Phase asymmetry; positive values scatter forward |
+| `r_ptPhysicalFogRadius` | `30` | Volume radius in meters |
+| `r_ptPhysicalFogSteps` | `16` | Stratified integration samples per ray segment |
+
+Start with `r_ptPhysicalFogDensity 0.01`. More integration steps or accumulated
+samples reduce noise. Volume light stays outside surface-history denoising and
+converges through the progressive mean, including in `r_ptSequence`. Fog changes
+invalidate accumulation/history; legacy `r_ptVolumetric` does not control this medium.
+
+#### Explicit physical material transport
+
+No material is guessed to be glass from its name, alpha, or screen-space shader.
+Add an optional top-level block to an authored `.mtr` material:
+
+```
+ptMaterial {
+    transmission 1
+    ior 1.5
+    thin 0
+    absorption 0.1 0.4 1.2
+}
+```
+
+In physical path tracing, `transmission` (0..1, default 0) mixes dielectric transport
+with the opaque GGX material. `ior` defaults to 1.5 (range 1..3).
+`absorption` is linear RGB extinction in inverse meters (default zero), not an
+sRGB tint. Solid glass uses actual traveled thickness, exact dielectric Fresnel,
+Snell refraction, total internal reflection, and radiance-mode IOR weighting.
+Closed, consistently wound meshes are required; nested closed dielectric shells
+are supported within the configured bounce budget. Increase `r_ptMaxDepth` for
+multiple glass interfaces; every interface consumes a bounce.
+
+`thin 1` models a zero-geometric-thickness parallel glass sheet, including internal
+interface reflection and absorption. `thickness` (default 0.005 meters) controls
+its optical thickness. `thin 2` instead transmits diffusely into the opposite
+hemisphere, tinted by the material's linear albedo; use this for thin paper or
+fabric. This is not subsurface multiple scattering. The block also accepts
+`metallic` (0..1) and `roughness` (0.04..1) overrides for opaque GGX reflection.
+Explicit physical materials use these values rather than deriving them from
+legacy specular maps. Glass interfaces are currently ideal smooth dielectrics,
+not rough microfacet transmission.
+
+An explicit block replaces legacy overlay blending/self-illumination for that
+material in physical builds. Existing material textures remain available.
+Default builds parse the block but ignore its physical settings. Call `r_ptReset`
+after reloading changed materials to rebuild the path tracer's material cache.
+Transparent primary pixels retain the raw progressive fallback: no false opaque
+temporal history is reused. Straight next-event shadow rays transmit through thin
+clear sheets but cannot represent refracted solid-glass or diffuse-sheet caustics;
+those surfaces block direct shadow rays. Offscreen/portal-excluded geometry
+remains an extraction limitation, and no point-light caustic solver is provided.
+
+The physical GPU tests cover Fresnel/TIR/Snell math, spectrally absorbed solid and
+thin transport over successive progressive frames, diffuse-sheet transport,
+bounded fog extinction, analytic single scattering, and volumetric occlusion.
+With `PT_CUDA_DENOISING_TESTS`, `pt_cuda_postprocess_test` additionally checks HDR
+highlight spreading, exposure thresholds, disabled identity, and immutable inputs.
 
 ## Console Commands
 

@@ -428,5 +428,27 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
     }
     emission.Set( mat.emission[0], mat.emission[1], mat.emission[2] );
 
+#ifdef PT_PHYSICAL
+    const physicalMaterialInfo_t &physical = material->GetPhysicalMaterial();
+    if ( physical.enabled ) {
+        mat.physicalMaterial = 1;
+        mat.transmission = physical.transmission;
+        mat.ior = physical.ior;
+        mat.thinTransmission = physical.thin;
+        mat.thickness = physical.thickness;
+        for ( int c = 0; c < 3; c++ ) mat.absorption[c] = physical.absorption[c];
+        if ( physical.roughness >= 0.0f ) mat.roughness = physical.roughness;
+        if ( physical.metallic >= 0.0f ) mat.metallic = physical.metallic;
+        // Explicit transport replaces authored overlay compositing, not its texture.
+        mat.blendMode = PT_BLEND_OPAQUE;
+        if ( mat.isAmbientOnly ) {
+            mat.emission[0] = mat.emission[1] = mat.emission[2] = 0.0f;
+            mat.emissionTexture = -1;
+            emission.Zero();
+        }
+        mat.isAmbientOnly = mat.noShadows = 0;
+    }
+#endif
+
     #undef SAFE_REG
 }

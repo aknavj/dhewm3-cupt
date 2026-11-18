@@ -240,6 +240,31 @@ __device__ bool PT_ShadowTransmit(
 	}
 
 	if (m.transmission > 0.0f) {
+#ifdef PT_PHYSICAL
+		if (m.physicalMaterial) {
+			// Straight next-event rays cannot represent bent solid-glass caustics.
+			if (m.thinTransmission == 0) return false;
+			const float* p0 = vertices[tri.vertexIndices[0]].position;
+			const float* p1 = vertices[tri.vertexIndices[1]].position;
+			const float* p2 = vertices[tri.vertexIndices[2]].position;
+			float e1[3], e2[3], n[3];
+			for (int c = 0; c < 3; c++) { e1[c] = p1[c] - p0[c]; e2[c] = p2[c] - p0[c]; }
+			cross3(e1, e2, n);
+			normalize3(n);
+			const float cosine = fabsf(dot3(n, dir));
+			float cosineT;
+			const float f = PT_DielectricFresnel(cosine, 1.0f, m.ior, cosineT);
+			// A diffuse sheet does not transmit a collimated next-event ray.
+			if (m.thinTransmission == 2) return false;
+			for (int c = 0; c < 3; c++) {
+				float reflection, transmitted;
+				PT_ThinDielectric(f, PT_Beer(m.absorption[c], m.thickness / fmaxf(cosineT, 1e-5f)),
+					reflection, transmitted);
+				atten[c] *= m.transmission * transmitted;
+			}
+			return true;
+		}
+#endif
 		const float* p0 = vertices[tri.vertexIndices[0]].position;
 		const float* p1 = vertices[tri.vertexIndices[1]].position;
 		const float* p2 = vertices[tri.vertexIndices[2]].position;
@@ -405,6 +430,10 @@ __global__ void PathTracingKernel(
 		float indirectBaseline[3] = {}, volumeBaseline[3] = {}, diffuseFraction[3] = {};
 		bool splitIndirect = false;
 		bool lastSampledLights = false;
+#ifdef PT_PHYSICAL
+		int mediumMaterials[16];
+		int mediumCount = 0;
+#endif
 
 		int depth = 0;
 		const int maxTransparentPasses = maxDepth * 8;  // generous budget for overlapping particles/decals
@@ -418,7 +447,29 @@ __global__ void PathTracingKernel(
 			hitInfo.barycentrics[1] = 0.0f;
 			hitInfo.barycentrics[2] = 0.0f;
 
-			if (!IntersectBVH(ray, vertices, triangles, bvhNodes, triIndices, materials, hitInfo)) {
+			const bool foundHit = IntersectBVH(ray, vertices, triangles, bvhNodes, triIndices, materials, hitInfo);
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params)) {
+				const float segmentLength = foundHit ? hitInfo.t : ray.tMax;
+				if (mediumCount > 0) {
+					const ptMaterial_t& medium = materials[mediumMaterials[mediumCount - 1]];
+					for (int c = 0; c < 3; c++) pathThroughput[c] *= PT_Beer(medium.absorption[c],
+						segmentLength * params.physicalMetersPerUnit);
+				} else if (params.physicalFogDensity > 0.0f) {
+					float scattering[3];
+					PT_PhysicalSingleScattering(params, ray, segmentLength, vertices, triangles, bvhNodes,
+						triIndices, materials, textures, lights, numLights, &rng, scattering);
+					const float transmit = PT_PhysicalFogTransmit(params, ray.origin, ray.direction, segmentLength);
+					for (int c = 0; c < 3; c++) {
+						const float contribution = pathThroughput[c] * scattering[c];
+						pathRadiance[c] += contribution;
+						volumeRadiance[c] += contribution;
+						pathThroughput[c] *= transmit;
+					}
+				}
+			}
+#endif
+			if (!foundHit) {
 				// sky dome - primary rays only (bounce misses return black for Doom 3 darkness)
 				if ((depth == 0
 #ifdef PT_PHYSICAL
@@ -449,6 +500,12 @@ __global__ void PathTracingKernel(
 			ray.worldTMin = fmaxf(0.0f, ray.worldTMin - hitInfo.t);
 
 			const ptMaterial_t& material = materials[hitInfo.materialIndex];
+			float materialIor = 0.0f;
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params)) {
+				materialIor = material.physicalMaterial ? material.ior : params.physicalIor;
+			}
+#endif
 
 			// rays leaving the view weapon skip the world geometry it pokes into
 			const bool hitWeapon = (hitInfo.triFlags & PT_TRI_WEAPON) != 0;
@@ -534,7 +591,11 @@ __global__ void PathTracingKernel(
 			float roughness = material.roughness;
 			float specColor[3] = { 1.0f, 1.0f, 1.0f };
 
-			if (material.specularTexture >= 0 && textures) {
+			if (material.specularTexture >= 0 && textures
+#ifdef PT_PHYSICAL
+				&& !material.physicalMaterial
+#endif
+				) {
 				float specularMap[4];
 				SampleTexture(textures, material.specularTexture, tu, tv, specularMap);
 
@@ -602,7 +663,7 @@ __global__ void PathTracingKernel(
 						sampleGuide.specularAlbedo[c] = fmaxf(0.01f, f0 * specularBoost * specColor[c]);
 #ifdef PT_PHYSICAL
 						if (PT_PhysicalActive(&params)) {
-							sampleGuide.specularAlbedo[c] = fmaxf(0.01f, PT_PhysicalF0(albedo[c], metallic, params.physicalIor));
+							sampleGuide.specularAlbedo[c] = fmaxf(0.01f, PT_PhysicalF0(albedo[c], metallic, materialIor));
 						}
 #endif
 						cameraDelta[c] = hitInfo.position[c] - cameraPos[c];
@@ -724,7 +785,106 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			// Transmission / glass: Fresnel reflection vs refraction
 			// ---------------------------------------------------------------
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params) && material.physicalMaterial && material.transmission > 0.0f
+				&& (depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !lastSampledLights)) {
+				float glow[4] = { 1, 1, 1, 1 };
+				if (material.emissionTexture >= 0 && textures) SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
+				for (int c = 0; c < 3; c++) pathRadiance[c] += pathThroughput[c] * material.emission[c] * glow[c] * emissionBoost;
+			}
+			if (PT_PhysicalActive(&params) && material.physicalMaterial && material.transmission > 0.0f
+				&& PT_Rand(&rng) < material.transmission) {
+				const ptTriangle_t& tri = triangles[hitInfo.triangleIndex];
+				float e1[3], e2[3], normal[3];
+				for (int c = 0; c < 3; c++) {
+					e1[c] = vertices[tri.vertexIndices[1]].position[c] - vertices[tri.vertexIndices[0]].position[c];
+					e2[c] = vertices[tri.vertexIndices[2]].position[c] - vertices[tri.vertexIndices[0]].position[c];
+				}
+				cross3(e1, e2, normal);
+				normalize3(normal);
+				const bool entering = dot3(ray.direction, normal) < 0.0f;
+				if (!entering) for (int c = 0; c < 3; c++) normal[c] = -normal[c];
+				const bool solid = material.thinTransmission == 0;
+				const float etaI = mediumCount > 0 ? materials[mediumMaterials[mediumCount - 1]].ior
+					: (solid && !entering ? material.ior : 1.0f);
+				const float etaT = solid && !entering
+					? (mediumCount > 1 ? materials[mediumMaterials[mediumCount - 2]].ior : 1.0f) : material.ior;
+				const float cosine = fmaxf(0.0f, -dot3(ray.direction, normal));
+				float cosineT;
+				float fresnel = PT_DielectricFresnel(cosine, etaI, etaT, cosineT);
+				float sheetReflection[3], sheetTransmission[3];
+				if (!solid) {
+					float probability = 0.0f;
+					for (int c = 0; c < 3; c++) {
+						PT_ThinDielectric(fresnel, PT_Beer(material.absorption[c],
+							material.thickness / fmaxf(cosineT, 1e-5f)), sheetReflection[c], sheetTransmission[c]);
+						probability += sheetReflection[c] / 3.0f;
+					}
+					fresnel = probability;
+				}
+				const bool reflected = PT_Rand(&rng) < fresnel;
+				float next[3];
+				bool sampledTransmissionLights = false;
+				if (reflected) {
+					for (int c = 0; c < 3; c++) {
+						next[c] = ray.direction[c] + 2.0f * cosine * normal[c];
+						if (!solid) pathThroughput[c] *= sheetReflection[c] / fmaxf(fresnel, 1e-8f);
+					}
+				} else if (solid) {
+					const float eta = etaI / etaT;
+					for (int c = 0; c < 3; c++) {
+						next[c] = eta * ray.direction[c] + (eta * cosine - cosineT) * normal[c];
+						pathThroughput[c] *= eta * eta;
+					}
+					if (entering) {
+						// Every interface consumes a bounce; maxDepth is bounded to 16.
+						if (mediumCount >= 16) break;
+						mediumMaterials[mediumCount++] = hitInfo.materialIndex;
+					} else if (mediumCount > 0) {
+						mediumCount--;
+					} else {
+						for (int c = 0; c < 3; c++) pathThroughput[c] *= PT_Beer(material.absorption[c],
+							hitInfo.t * params.physicalMetersPerUnit);
+					}
+				} else {
+					for (int c = 0; c < 3; c++) pathThroughput[c] *= sheetTransmission[c] / fmaxf(1.0f - fresnel, 1e-8f);
+					if (material.thinTransmission == 2) {
+						float opposite[3], pdf;
+						for (int c = 0; c < 3; c++) { opposite[c] = -normal[c]; pathThroughput[c] *= albedo[c]; }
+						int picks[PT_MAX_LIGHT_PICKS];
+						float weights[PT_MAX_LIGHT_PICKS];
+						const int count = PT_SelectLights(lights, numLights, hitInfo.position, opposite,
+							min(numLights, maxLightSamples), emissionBoost, &rng, picks, weights, &params);
+						sampledTransmissionLights = count > 0;
+						for (int i = 0; i < count; i++) {
+							float direct[3], wi[3];
+							SampleDirectLight(lights[picks[i]], hitInfo.position, opposite, shadeWorldTMin, emissionBoost,
+								vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, direct, wi, &params);
+							for (int c = 0; c < 3; c++) pathRadiance[c] += pathThroughput[c] * direct[c] * weights[i] / PT_PI;
+						}
+						SampleHemisphere(opposite, &rng, next, pdf);
+					} else {
+						for (int c = 0; c < 3; c++) next[c] = ray.direction[c];
+					}
+				}
+				normalize3(next);
+				for (int c = 0; c < 3; c++) {
+					ray.origin[c] = hitInfo.position[c] + next[c] * rayOffset;
+					ray.direction[c] = next[c];
+				}
+				ray.tMin = rayOffset;
+				ray.tMax = 1e10f;
+				ray.worldTMin = shadeWorldTMin;
+				ray.flags = 0;
+				lastSampledLights = sampledTransmissionLights;
+				depth++;
+				continue;
+			}
+#endif
 			if (material.transmission > 0.0f) {
+#ifdef PT_PHYSICAL
+				if (!PT_PhysicalActive(&params) || !material.physicalMaterial) {
+#endif
 				float negDir[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 				float cosTheta = fabsf(dot3(surfaceNormal, negDir));
 				float r0 = (material.ior - 1.0f) / (material.ior + 1.0f);
@@ -743,13 +903,20 @@ __global__ void PathTracingKernel(
 					ray.tMin = rayOffset;
 					continue;  // glass transmission — does NOT increment depth
 				}
+#ifdef PT_PHYSICAL
+				}
+#endif
 			}
 
 			// ---------------------------------------------------------------
 			// Emission
 			// ---------------------------------------------------------------
 			// skip emitters the previous bounce's light sampling already covered
-			if (depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !lastSampledLights) {
+			if ((depth == 0 || !(hitInfo.triFlags & PT_TRI_AREA_LIGHT) || !lastSampledLights)
+#ifdef PT_PHYSICAL
+				&& !(PT_PhysicalActive(&params) && material.physicalMaterial && material.transmission > 0.0f)
+#endif
+				) {
 				float glow[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 				if (material.emissionTexture >= 0 && textures) {
 					SampleTextureSrgb(textures, material.emissionTexture, tu, tv, glow);
@@ -783,7 +950,7 @@ __global__ void PathTracingKernel(
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 						float directBrdf[3], diffuseBrdf[3];
 						EvaluatePBRMaterial(albedo, surfaceNormal, wo, wi, metallic, roughness, specularBoost, specColor,
-							directBrdf, diffuseBrdf, &params);
+							directBrdf, diffuseBrdf, &params, materialIor);
 
 						float alphaScale = (material.blendMode == PT_BLEND_ALPHA) ? albedo[3] : 1.0f;
 						pathRadiance[0] += pathThroughput[0] * directLight[0] * directBrdf[0] * alphaScale * lightWeight;
@@ -951,7 +1118,7 @@ __global__ void PathTracingKernel(
 			float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 #ifdef PT_PHYSICAL
 			if (PT_PhysicalActive(&params)) {
-				PT_SamplePhysicalBsdf(surfaceNormal, wo, albedo, metallic, roughness, params.physicalIor, &rng, nextDir, pdf);
+				PT_SamplePhysicalBsdf(surfaceNormal, wo, albedo, metallic, roughness, materialIor, &rng, nextDir, pdf);
 			} else
 #endif
 			SampleHemisphere(surfaceNormal, &rng, nextDir, pdf);
@@ -968,7 +1135,7 @@ __global__ void PathTracingKernel(
 
 			if (material.blendMode == 0 || material.blendMode == 1) {
 				EvaluatePBRMaterial(albedo, surfaceNormal, wo, nextDir, metallic, roughness, specularBoost, specColor,
-					brdf, diffuseBrdf, &params);
+					brdf, diffuseBrdf, &params, materialIor);
 			} else {
 				EvaluateMaterial(albedo, surfaceNormal, wo, nextDir, brdf);
 			}

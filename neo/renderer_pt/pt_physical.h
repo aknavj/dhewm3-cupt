@@ -37,6 +37,9 @@ PT_PHYSICAL_INLINE bool PT_PhysicalTraceChanged( const ptRenderParams_t &a, cons
 		|| a.physicalLightLumens != b.physicalLightLumens || a.physicalSunLux != b.physicalSunLux
 		|| a.physicalIor != b.physicalIor || a.physicalRoughnessScale != b.physicalRoughnessScale
 		|| a.physicalApertureRadius != b.physicalApertureRadius
+		|| a.physicalFogDensity != b.physicalFogDensity || a.physicalFogAlbedo != b.physicalFogAlbedo
+		|| a.physicalFogAnisotropy != b.physicalFogAnisotropy
+		|| a.physicalFogRadius != b.physicalFogRadius || a.physicalFogSteps != b.physicalFogSteps
 		|| a.physicalFocusDistance != b.physicalFocusDistance;
 }
 

@@ -175,6 +175,24 @@ cudaError_t LaunchDenoisingKernel( const ptCudaDenoiseBuffers_t *buffers, const 
 cudaError_t LaunchDenoisingDebugKernel( const ptCudaDenoiseBuffers_t *buffers, unsigned char *output,
 								const ptRenderParams_t *params, int frameSlot, cudaStream_t stream );
 
+// Dedicated display-only storage: never aliases accumulation or denoiser history.
+typedef struct {
+	float *highlights;
+	float *scratch;
+	float *blurred;
+	float *output;
+} ptCudaPostprocessBuffers_t;
+
+inline int PT_CudaPostprocessScale( int height, float radius ) {
+	const float boundedRadius = radius > 0.0f && radius <= 3.402823466e38f ? ( radius < 0.1f ? radius : 0.1f ) : 0.025f;
+	int scale = 4;
+	while ( boundedRadius * height / scale > 3.0f ) scale *= 2;
+	return scale;
+}
+
+cudaError_t LaunchPostprocessKernel( const ptCudaPostprocessBuffers_t *buffers, const float *hdr,
+									const ptRenderParams_t *params, cudaStream_t stream );
+
 // resolves the accumulation buffer into RGBA8
 void LaunchToneMappingKernel( const float *hdrBuffer, unsigned char *ldrBuffer, int width, int height,
 							  float exposure, float gamma, int toneMapMode, cudaStream_t stream );

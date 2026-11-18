@@ -6,6 +6,51 @@
 #include "renderer_pt/pt_physical.h"
 #include "renderer_pt/cuda/pt_cuda_math.cuh"
 
+__device__ inline float PT_DielectricFresnel(float cosine, float etaI, float etaT, float& cosineT) {
+	cosine = clamp(cosine, 0.0f, 1.0f);
+	const float eta = etaI / etaT;
+	const float sin2T = eta * eta * fmaxf(0.0f, 1.0f - cosine * cosine);
+	cosineT = sqrtf(fmaxf(0.0f, 1.0f - sin2T));
+	if (sin2T >= 1.0f) return 1.0f;
+	if (etaI == etaT) return 0.0f;
+	const float rs = (etaI * cosine - etaT * cosineT) / fmaxf(etaI * cosine + etaT * cosineT, 1e-12f);
+	const float rp = (etaT * cosine - etaI * cosineT) / fmaxf(etaT * cosine + etaI * cosineT, 1e-12f);
+	return 0.5f * (rs * rs + rp * rp);
+}
+
+__device__ inline float PT_Beer(float coefficient, float meters) {
+	return expf(-fmaxf(0.0f, coefficient) * fmaxf(0.0f, meters));
+}
+
+__device__ inline void PT_ThinDielectric(float fresnel, float absorption, float& reflection, float& transmission) {
+	const float denominator = fmaxf(1.0f - fresnel * fresnel * absorption * absorption, 1e-8f);
+	transmission = (1.0f - fresnel) * (1.0f - fresnel) * absorption / denominator;
+	reflection = fresnel + transmission * fresnel * absorption;
+}
+
+__device__ inline float PT_PhysicalFogInterval(
+	const ptRenderParams_t& p, const float* origin, const float* direction, float distance, float& start
+) {
+	start = 0.0f;
+	if (p.physicalFogDensity <= 0.0f || p.physicalFogRadius <= 0.0f) return 0.0f;
+	float offset[3];
+	for (int c = 0; c < 3; c++) offset[c] = origin[c] - p.camPos[c];
+	const float b = dot3(offset, direction);
+	const float discriminant = b * b - dot3(offset, offset) + p.physicalFogRadius * p.physicalFogRadius;
+	if (discriminant <= 0.0f) return 0.0f;
+	const float root = sqrtf(discriminant);
+	start = fmaxf(0.0f, -b - root);
+	return fmaxf(0.0f, fminf(distance, -b + root) - start);
+}
+
+__device__ inline float PT_PhysicalFogTransmit(
+	const ptRenderParams_t& p, const float* origin, const float* direction, float distance
+) {
+	float start;
+	return PT_Beer(p.physicalFogDensity,
+		PT_PhysicalFogInterval(p, origin, direction, distance, start) * p.physicalMetersPerUnit);
+}
+
 __device__ inline float PT_PhysicalF0(float albedo, float metallic, float ior) {
 	const float f = (ior - 1.0f) / (ior + 1.0f);
 	return f * f * (1.0f - metallic) + albedo * metallic;

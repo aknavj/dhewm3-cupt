@@ -343,6 +343,17 @@ typedef enum {
 
 class idSoundEmitter;
 
+typedef struct {
+	bool enabled;
+	float transmission;
+	float ior;
+	float absorption[3];
+	float thickness;
+	int thin;
+	float roughness;
+	float metallic;
+} physicalMaterialInfo_t;
+
 class idMaterial : public idDecl {
 public:
 						idMaterial();
@@ -545,6 +556,7 @@ public:
 	int					Spectrum( void ) const { return spectrum; }
 
 	float				GetPolygonOffset( void ) const { return polygonOffset; }
+	const physicalMaterialInfo_t &GetPhysicalMaterial( void ) const { return physicalMaterial; }
 
 	float				GetSurfaceArea( void ) const { return surfaceArea; }
 	void				AddToSurfaceArea( float area ) { surfaceArea += area; }
@@ -688,6 +700,7 @@ private:
 	bool				suppressInSubview;
 	bool				portalSky;
 	int					refCount;
+	physicalMaterialInfo_t physicalMaterial;
 };
 
 typedef idList<const idMaterial *> idMatList;

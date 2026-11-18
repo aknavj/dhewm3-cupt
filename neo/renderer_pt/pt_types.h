@@ -116,6 +116,12 @@ typedef struct {
 	float bumpScale;
 	float texTransform[6];		// affine transform: u'=x0*u+x1*v+x2, v'=x3*u+x4*v+x5
 	float polygonOffset;		// depth bias for decals
+#ifdef PT_PHYSICAL
+	int physicalMaterial;		// explicit ptMaterial block, never inferred from alpha
+	int thinTransmission;		// 0 solid dielectric, 1 thin glass, 2 diffuse sheet
+	float absorption[3];		// Beer-Lambert absorption coefficients in inverse meters
+	float thickness;			// thin sheet thickness in meters
+#endif
 } ptMaterial_t;
 
 typedef struct {
@@ -180,6 +186,11 @@ typedef struct {
 	float physicalRoughnessScale;
 	float physicalApertureRadius;	// world units; zero selects a pinhole
 	float physicalFocusDistance;	// world units, along camForward
+	float physicalFogDensity;	// extinction coefficient in inverse meters
+	float physicalFogAlbedo;
+	float physicalFogAnisotropy;
+	float physicalFogRadius;		// camera-centered homogeneous sphere, world units
+	int physicalFogSteps;
 #endif
 
 	// trace resolution, must be <= the size passed to idPathTracerBackend::Resize
@@ -232,6 +243,10 @@ typedef struct {
 	float exposure;
 	float gamma;
 	int toneMapMode;			// ptToneMap_t
+	float bloomStrength;
+	float bloomThreshold;		// exposed linear highlight threshold
+	float bloomRadius;			// fraction of image height
+	float lensFlareStrength;
 } ptRenderParams_t;
 
 #endif /* !__PT_TYPES_H__ */

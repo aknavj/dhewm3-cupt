@@ -69,6 +69,10 @@ idCVar r_ptDenoiseDebugSignal( "r_ptDenoiseDebugSignal", "0", CVAR_RENDERER | CV
 idCVar r_ptExposure( "r_ptExposure", "1.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "exposure multiplier" );
 idCVar r_ptGamma( "r_ptGamma", "2.2", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "output gamma, textures and colors are decoded with 2.2", 0.1f, 10.0f );
 idCVar r_ptToneMapMode( "r_ptToneMapMode", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER, "0 = Reinhard, 1 = ACES, 2 = Uncharted 2", 0, 2 );
+idCVar r_ptBloom( "r_ptBloom", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "HDR bloom strength (0 = off)", 0.0f, 1.0f );
+idCVar r_ptBloomThreshold( "r_ptBloomThreshold", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "bloom threshold after photographic exposure, before tone mapping", 0.01f, 100.0f );
+idCVar r_ptBloomRadius( "r_ptBloomRadius", "0.025", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "bloom radius as a fraction of image height", 0.001f, 0.1f );
+idCVar r_ptLensFlare( "r_ptLensFlare", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "optional screen-space lens ghost strength (0 = off)", 0.0f, 1.0f );
 
 // sky
 idCVar r_ptSkyIntensity( "r_ptSkyIntensity", "0.0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT, "sky dome intensity for primary ray misses" );
@@ -464,6 +468,10 @@ static void PT_SetupParams( ptRenderParams_t &p, const viewDef_t *viewDef, int t
 	p.exposure = Max( 0.001f, r_ptExposure.GetFloat() );
 	p.gamma = r_ptGamma.GetFloat();
 	p.toneMapMode = r_ptToneMapMode.GetInteger();
+	p.bloomStrength = r_ptBloom.GetFloat();
+	p.bloomThreshold = r_ptBloomThreshold.GetFloat();
+	p.bloomRadius = r_ptBloomRadius.GetFloat();
+	p.lensFlareStrength = r_ptLensFlare.GetFloat();
 #ifdef PT_PHYSICAL
 	R_PT_PhysicalParams( p );
 #endif

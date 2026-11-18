@@ -62,6 +62,8 @@ private:
 	void					OnError( const char *what, cudaError_t err );
 	bool					ResizeDenoiser( int width, int height );
 	void					FreeDenoiser();
+	bool					ResizePostprocess( int width, int height, float radius );
+	void					FreePostprocess();
 
 	bool					initialized;
 	bool					healthy;
@@ -80,6 +82,8 @@ private:
 	int						accumFrames;
 	float					traceMs;
 	ptCudaDenoiseBuffers_t	denoiser;
+	ptCudaPostprocessBuffers_t postprocess;
+	int						postWidth, postHeight, postScale;
 	int						denoiseWidth;
 	int						denoiseHeight;
 	int						denoiseFrameSlot;
@@ -135,6 +139,8 @@ idPathTracerBackendCUDA::idPathTracerBackendCUDA() {
 	accumFrames = 0;
 	traceMs = 0.0f;
 	memset( &denoiser, 0, sizeof( denoiser ) );
+	memset( &postprocess, 0, sizeof( postprocess ) );
+	postWidth = postHeight = postScale = 0;
 	memset( &previousDenoiseParams, 0, sizeof( previousDenoiseParams ) );
 	denoiseWidth = denoiseHeight = 0;
 	denoiseFrameSlot = 0;
@@ -287,6 +293,7 @@ void idPathTracerBackendCUDA::Shutdown() {
 	cudaFree( d_texDesc );			d_texDesc = NULL;
 	cudaFree( d_accum );			d_accum = NULL;
 	FreeDenoiser();
+	FreePostprocess();
 	cudaFree( d_output );			d_output = NULL;
 	cudaFree( d_vertices );			d_vertices = NULL;		capVertices = 0;
 	cudaFree( d_triangles );		d_triangles = NULL;		capTriangles = 0;
@@ -344,6 +351,7 @@ bool idPathTracerBackendCUDA::Resize( int width, int height ) {
 
 	cudaFree( d_accum );	d_accum = NULL;
 	FreeDenoiser();
+	FreePostprocess();
 	cudaFree( d_output );	d_output = NULL;
 	maxWidth = maxHeight = 0;
 
@@ -398,6 +406,31 @@ bool idPathTracerBackendCUDA::ResizeDenoiser( int width, int height ) {
 	}
 	denoiseWidth = width;
 	denoiseHeight = height;
+	return true;
+}
+
+void idPathTracerBackendCUDA::FreePostprocess() {
+	cudaFree( postprocess.highlights );
+	cudaFree( postprocess.scratch );
+	cudaFree( postprocess.blurred );
+	cudaFree( postprocess.output );
+	memset( &postprocess, 0, sizeof( postprocess ) );
+	postWidth = postHeight = postScale = 0;
+}
+
+bool idPathTracerBackendCUDA::ResizePostprocess( int width, int height, float radius ) {
+	const int scale = PT_CudaPostprocessScale( height, radius );
+	if ( width == postWidth && height == postHeight && scale == postScale ) return true;
+	PT_CUDA_CHECK( cudaStreamSynchronize( stream ) );
+	FreePostprocess();
+	const size_t smallBytes = (size_t)( ( width + scale - 1 ) / scale ) * ( ( height + scale - 1 ) / scale ) * 4 * sizeof( float );
+	PT_CUDA_CHECK( cudaMalloc( &postprocess.highlights, smallBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &postprocess.scratch, smallBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &postprocess.blurred, smallBytes ) );
+	PT_CUDA_CHECK( cudaMalloc( &postprocess.output, (size_t)width * height * 4 * sizeof( float ) ) );
+	postWidth = width;
+	postHeight = height;
+	postScale = scale;
 	return true;
 }
 
@@ -665,6 +698,11 @@ bool idPathTracerBackendCUDA::Render( const ptRenderParams_t &params ) {
 	if ( denoise && p.denoiseDebug >= 1 && p.denoiseDebug <= 4 ) {
 		PT_CUDA_CHECK( LaunchDenoisingDebugKernel( &denoiser, d_output, &p, denoiseFrameSlot, stream ) );
 	} else {
+		if ( accumulate && p.denoiseDebug == 0 && ( p.bloomStrength > 0.0f || p.lensFlareStrength > 0.0f ) ) {
+			if ( !ResizePostprocess( p.width, p.height, p.bloomRadius ) ) return false;
+			PT_CUDA_CHECK( LaunchPostprocessKernel( &postprocess, hdrBuffer, &p, stream ) );
+			hdrBuffer = postprocess.output;
+		}
 		LaunchToneMappingKernel( hdrBuffer, d_output, p.width, p.height, p.exposure, p.gamma, p.toneMapMode, stream );
 		PT_CUDA_CHECK( cudaGetLastError() );
 	}
@@ -709,6 +747,9 @@ void idPathTracerBackendCUDA::GetStats( ptBackendStats_t &stats ) const {
 	stats.deviceBytes = textureBytes
 		+ (size_t)maxWidth * maxHeight * 4 * ( sizeof( float ) + 1 )
 		+ (size_t)denoiseWidth * denoiseHeight * ( 14 * 4 * sizeof( float ) + 2 * sizeof( ptCudaDenoiseGuide_t ) )
+		+ (size_t)postWidth * postHeight * 4 * sizeof( float )
+		+ ( postScale > 0 ? (size_t)( ( postWidth + postScale - 1 ) / postScale ) *
+			( ( postHeight + postScale - 1 ) / postScale ) * 3 * 4 * sizeof( float ) : 0 )
 		+ (size_t)capVertices * sizeof( ptVertex_t )
 		+ (size_t)capTriangles * sizeof( ptTriangle_t )
 		+ (size_t)capBVHNodes * sizeof( ptBVHNode_t )

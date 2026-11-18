@@ -648,7 +648,8 @@ __device__ void SampleDirectLight(
 	ptRng_t* rng,
 	float* radiance,
 	float* wi,
-	const ptRenderParams_t* params = NULL
+	const ptRenderParams_t* params = NULL,
+	bool volumeSample = false
 ) {
 	radiance[0] = radiance[1] = radiance[2] = 0.0f;
 
@@ -693,7 +694,7 @@ __device__ void SampleDirectLight(
 		wi[2] /= distance;
 	}
 
-	const float ndotl = dot3(normal, wi);
+	const float ndotl = volumeSample ? 1.0f : dot3(normal, wi);
 	if (ndotl <= 0.0f) return;
 
 	float lightColor[3];
@@ -771,10 +772,63 @@ __device__ void SampleDirectLight(
 		return;
 	}
 
+#ifdef PT_PHYSICAL
+	if (PT_PhysicalActive(params)) {
+		const float transmittance = PT_PhysicalFogTransmit(*params, position, wi, distance);
+		for (int c = 0; c < 3; c++) shadow[c] *= transmittance;
+	}
+#endif
 	radiance[0] = lightColor[0] * contribution * shadow[0];
 	radiance[1] = lightColor[1] * contribution * shadow[1];
 	radiance[2] = lightColor[2] * contribution * shadow[2];
 }
+
+#ifdef PT_PHYSICAL
+__device__ void PT_PhysicalSingleScattering(
+	const ptRenderParams_t& p, const ptRay_t& ray, float distance,
+	const ptVertex_t* vertices, const ptTriangle_t* triangles, const ptBVHNode_t* nodes,
+	const int* triIndices, const ptMaterial_t* materials, const cudaTexture_t* textures,
+	const ptLight_t* lights, int numLights, ptRng_t* rng, float* scattering
+) {
+	scattering[0] = scattering[1] = scattering[2] = 0.0f;
+	if (numLights <= 0 || p.physicalFogAlbedo <= 0.0f) return;
+	float start;
+	const float length = PT_PhysicalFogInterval(p, ray.origin, ray.direction, distance, start);
+	if (length <= 0.0f) return;
+	const int steps = max(1, min(128, p.physicalFogSteps));
+	const float step = length / steps;
+	for (int i = 0; i < steps; i++) {
+		const float t = start + (i + PT_Rand(rng)) * step;
+		float position[3];
+		for (int c = 0; c < 3; c++) position[c] = ray.origin[c] + ray.direction[c] * t;
+		int light = 0;
+		float lightWeight = 1.0f;
+		const float noOffset[3] = {};
+		if (numLights > 1) {
+			// A bounded reservoir avoids scanning every light at every fog sample.
+			// Its inverse weight remains unbiased over the uniform candidate set.
+			float total = 0.0f, chosenWeight = 0.0f;
+			const int candidates = min(numLights, 8);
+			for (int candidate = 0; candidate < candidates; candidate++) {
+				const int index = min((int)(PT_Rand(rng) * numLights), numLights - 1);
+				const float weight = fmaxf(LightImportance(lights[index], position, noOffset, p.emissionBoost, &p), 1e-12f);
+				total += weight;
+				if (candidate == 0 || PT_Rand(rng) * total < weight) { light = index; chosenWeight = weight; }
+			}
+			lightWeight = total * numLights / (chosenWeight * candidates);
+		}
+		float incoming[3], wi[3] = {};
+		SampleDirectLight(lights[light], position, noOffset, fmaxf(0.0f, ray.worldTMin - t), p.emissionBoost,
+			vertices, triangles, nodes, triIndices, materials, textures, rng, incoming, wi, &p, true);
+		if (incoming[0] + incoming[1] + incoming[2] <= 0.0f) continue;
+		// wi points toward the source, so forward scattering is wi == ray.direction.
+		const float phase = HenyeyGreenstein(dot3(ray.direction, wi), p.physicalFogAnisotropy);
+		const float weight = PT_Beer(p.physicalFogDensity, (t - start) * p.physicalMetersPerUnit)
+			* p.physicalFogDensity * p.physicalFogAlbedo * step * p.physicalMetersPerUnit * lightWeight * phase;
+		for (int c = 0; c < 3; c++) scattering[c] += incoming[c] * weight;
+	}
+}
+#endif
 
 /*
 =================================================================================

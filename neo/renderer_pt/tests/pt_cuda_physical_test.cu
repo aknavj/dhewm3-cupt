@@ -233,11 +233,252 @@ static void CheckPathIntegration() {
 	CheckNear("physical path specular", s[0], expectedSpecular, 0.001);
 	CheckNear("physical path signal conservation", result[0], d[0] + s[0], 0.001);
 	CheckNear("pinhole permits temporal history", g.historyValid, 1, 0);
+	p.physicalFogDensity = logf(2.0f);
+	p.physicalFogRadius = 1000;
+	p.physicalFogSteps = 8;
+	for (int c = 0; c < 3; c++) scene.material.emission[c] = 1;
+	CUDA_CHECK(cudaMemcpy(device, &scene, sizeof(scene), cudaMemcpyHostToDevice));
+	for (int frame = 0; frame < 2; frame++) {
+		p.frameIndex = frame;
+		PathTracingKernel<<<1, 1>>>(device->vertices, &device->triangle, &device->node, &device->index, &device->material,
+			NULL, &device->light, 0, accumulation, p, NULL, guide, diffuse, specular);
+		CUDA_CHECK(cudaGetLastError());
+		CUDA_CHECK(cudaMemcpy(result, accumulation, sizeof(result), cudaMemcpyDeviceToHost));
+		CheckNear("progressive fog extinction preserves residual emission", result[0], 50, 0.001);
+	}
 	CUDA_CHECK(cudaFree(device));
 	CUDA_CHECK(cudaFree(accumulation));
 	CUDA_CHECK(cudaFree(diffuse));
 	CUDA_CHECK(cudaFree(specular));
 	CUDA_CHECK(cudaFree(guide));
+}
+
+__global__ void CheckTransportMath(ptRenderParams_t p, float* results) {
+	float transmittedCosine;
+	results[0] = PT_DielectricFresnel(1.0f, 1.0f, 1.5f, transmittedCosine);
+	results[1] = transmittedCosine;
+	results[2] = PT_DielectricFresnel(0.5f, 1.5f, 1.0f, transmittedCosine);
+	results[3] = PT_DielectricFresnel(0.8f, 1.0f, 1.5f, transmittedCosine);
+	results[4] = transmittedCosine;
+	results[5] = PT_Beer(logf(2.0f), 1.0f);
+	const float origin[3] = {}, direction[3] = { 0, 0, 1 };
+	p.physicalFogDensity = 0.2f;
+	p.physicalFogRadius = 100;
+	results[6] = PT_PhysicalFogTransmit(p, origin, direction, 1000);
+	const float outside[3] = { 0, 0, -200 };
+	float start;
+	results[7] = PT_PhysicalFogInterval(p, outside, direction, 1000, start);
+	results[8] = start;
+	const float tangent[3] = { 200, 0, 0 };
+	results[9] = PT_PhysicalFogTransmit(p, tangent, direction, 1000);
+	results[10] = HenyeyGreenstein(1, 0.5f) > HenyeyGreenstein(-1, 0.5f);
+	ptVertex_t vertices[3] = {};
+	vertices[1].position[0] = vertices[2].position[1] = 1;
+	ptTriangle_t triangle = {};
+	triangle.vertexIndices[1] = 1;
+	triangle.vertexIndices[2] = 2;
+	ptMaterial_t material = {};
+	material.physicalMaterial = 1;
+	material.thinTransmission = 1;
+	material.transmission = 0.7f;
+	material.ior = 1.5f;
+	material.thickness = 1;
+	material.albedoTexture = -1;
+	for (int c = 0; c < 3; c++) material.absorption[c] = logf(2.0f);
+	float attenuation[3] = { 1, 1, 1 };
+	results[11] = PT_ShadowTransmit(direction, vertices, triangle, 0, 0, &material, NULL, attenuation);
+	results[12] = attenuation[0];
+	material.thinTransmission = 0;
+	results[13] = PT_ShadowTransmit(direction, vertices, triangle, 0, 0, &material, NULL, attenuation);
+	material.thinTransmission = 2;
+	results[14] = PT_ShadowTransmit(direction, vertices, triangle, 0, 0, &material, NULL, attenuation);
+}
+
+static void CheckTransmissionPaths() {
+	struct scene_t {
+		ptVertex_t vertices[9];
+		ptTriangle_t triangles[3];
+		ptBVHNode_t node;
+		ptMaterial_t materials[2];
+		ptLight_t light;
+		int indices[3];
+	} scene = {};
+	for (int plane = 0; plane < 3; plane++) {
+		ptVertex_t* v = scene.vertices + plane * 3;
+		v[0].position[0] = v[0].position[1] = -100000;
+		v[1].position[0] = 100000;
+		v[1].position[1] = -100000;
+		v[2].position[1] = 100000;
+		for (int j = 0; j < 3; j++) {
+			v[j].position[2] = 100.0f * (plane + 1);
+			v[j].normal[2] = plane == 1 ? 1 : -1;
+			scene.triangles[plane].vertexIndices[j] = plane * 3 + j;
+		}
+		if (plane != 1) {
+			scene.triangles[plane].vertexIndices[1] = plane * 3 + 2;
+			scene.triangles[plane].vertexIndices[2] = plane * 3 + 1;
+		}
+		scene.triangles[plane].materialIndex = plane == 2 ? 1 : 0;
+		scene.indices[plane] = plane;
+	}
+	scene.node.bounds[0] = scene.node.bounds[1] = -100000;
+	scene.node.bounds[2] = 100;
+	scene.node.bounds[3] = scene.node.bounds[4] = 100000;
+	scene.node.bounds[5] = 300;
+	scene.node.leftChild = scene.node.escapeIndex = -1;
+	scene.node.primitiveCount = 3;
+	for (int m = 0; m < 2; m++) {
+		ptMaterial_t& material = scene.materials[m];
+		material.albedoTexture = material.normalTexture = material.specularTexture = material.emissionTexture = -1;
+		material.texTransform[0] = material.texTransform[4] = 1;
+		material.albedo[3] = 1;
+		material.roughness = 0.5f;
+		for (int c = 0; c < 3; c++) material.albedo[c] = 1;
+	}
+	scene.materials[0].physicalMaterial = 1;
+	scene.materials[0].transmission = 1;
+	scene.materials[0].ior = 1.5f;
+	scene.materials[1].metallic = 1;
+	for (int c = 0; c < 3; c++) {
+		scene.materials[0].absorption[c] = logf(2.0f) * (c + 1);
+		scene.materials[1].albedo[c] = 0;
+		scene.materials[1].emission[c] = 1;
+	}
+	const int pixels = 4096;
+	scene_t* device = NULL;
+	float *accumulation = NULL, *diffuse = NULL, *specular = NULL;
+	ptCudaDenoiseGuide_t* guides = NULL;
+	CUDA_CHECK(cudaMalloc(&device, sizeof(scene)));
+	CUDA_CHECK(cudaMalloc(&accumulation, pixels * 4 * sizeof(float)));
+	CUDA_CHECK(cudaMemset(accumulation, 0, pixels * 4 * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&diffuse, pixels * 4 * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&specular, pixels * 4 * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&guides, pixels * sizeof(*guides)));
+	ptRenderParams_t p = PhysicalParams();
+	p.width = pixels; p.height = 1;
+	p.physicalApertureRadius = 0;
+	p.samplesPerPixel = 8;
+	p.maxDepth = 16;
+	p.rayOffset = 0.0001f;
+	p.emissionBoost = 1;
+	p.captureTargetFrames = 2;
+	std::vector<float> results(pixels * 4);
+	for (int mode = 0; mode < 3; mode++) {
+		scene.materials[0].thinTransmission = mode;
+		scene.materials[0].thickness = 1;
+		scene.node.primitiveCount = mode == 0 ? 3 : 2;
+		scene.indices[1] = mode == 0 ? 1 : 2;
+		if (mode == 2) {
+			// A diffuse sheet sees a constant unit environment on either side.
+			scene.node.primitiveCount = 1;
+			p.skyIntensity = 1;
+			for (int c = 0; c < 3; c++) p.skyZenith[c] = p.skyHorizon[c] = p.skyGround[c] = 1;
+		}
+		CUDA_CHECK(cudaMemcpy(device, &scene, sizeof(scene), cudaMemcpyHostToDevice));
+		for (int frame = 0; frame < 2; frame++) {
+			p.frameIndex = frame; p.sampleIndex = frame + 7;
+			PathTracingKernel<<<pixels / 256, 256>>>(device->vertices, device->triangles, &device->node, device->indices,
+				device->materials, NULL, &device->light, 0, accumulation, p, NULL, guides, diffuse, specular);
+			CUDA_CHECK(cudaGetLastError());
+			CUDA_CHECK(cudaMemcpy(results.data(), accumulation, results.size() * sizeof(float), cudaMemcpyDeviceToHost));
+			for (int c = 0; c < 3; c++) {
+				double mean = 0;
+				for (int i = 0; i < pixels; i++) mean += results[i * 4 + c] / pixels;
+				const double absorb = std::pow(0.5, c + 1);
+				const double f = 0.04;
+				const double transmitted = (1 - f) * (1 - f) * absorb / (1 - f * f * absorb * absorb);
+				const double reflected = f + transmitted * f * absorb;
+				const double expected = mode == 2 ? reflected + transmitted : transmitted;
+				CheckNear(mode == 0 ? "solid dielectric progressive absorption" :
+					(mode == 1 ? "thin glass progressive transport" : "diffuse sheet progressive transport"),
+					mean, expected, 0.012);
+			}
+		}
+		ptCudaDenoiseGuide_t guide;
+		CUDA_CHECK(cudaMemcpy(&guide, guides, sizeof(guide), cudaMemcpyDeviceToHost));
+		CheckNear("transmission rejects opaque denoising history", guide.depth, 0, 0);
+	}
+	scene.materials[0].transmission = 0.4f;
+	for (int c = 0; c < 3; c++) scene.materials[0].emission[c] = 0.25f;
+	CUDA_CHECK(cudaMemcpy(device, &scene, sizeof(scene), cudaMemcpyHostToDevice));
+	p.skyIntensity = 0;
+	p.maxDepth = 1;
+	p.frameIndex = 0;
+	PathTracingKernel<<<pixels / 256, 256>>>(device->vertices, device->triangles, &device->node, device->indices,
+		device->materials, NULL, &device->light, 0, accumulation, p, NULL, guides, diffuse, specular);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(results.data(), accumulation, results.size() * sizeof(float), cudaMemcpyDeviceToHost));
+	for (int i = 0; i < pixels; i++) CheckNear("mixed dielectric emission is counted exactly once", results[i * 4], 0.25, 1e-6);
+	CUDA_CHECK(cudaFree(device));
+	CUDA_CHECK(cudaFree(accumulation));
+	CUDA_CHECK(cudaFree(diffuse));
+	CUDA_CHECK(cudaFree(specular));
+	CUDA_CHECK(cudaFree(guides));
+}
+
+__global__ void CheckScattering(float* results) {
+	const int thread = blockIdx.x * blockDim.x + threadIdx.x;
+	results += thread * 6;
+	ptRenderParams_t p = {};
+	p.physicalIor = 1.5f;
+	p.physicalMetersPerUnit = 0.01f;
+	p.physicalSunLux = 10;
+	p.physicalFogDensity = 0.2f;
+	p.physicalFogAlbedo = 0.8f;
+	p.physicalFogRadius = 100;
+	p.physicalFogSteps = 16;
+	p.rayOffset = 0.001f;
+	ptRay_t ray = {};
+	ray.direction[2] = 1;
+	ptLight_t light = {};
+	light.type = PT_LIGHT_DIRECTIONAL;
+	light.direction[2] = -1;
+	light.intensity = 1;
+	light.color[0] = light.color[1] = light.color[2] = 1;
+	ptVertex_t vertices[3] = {};
+	vertices[0].position[0] = vertices[0].position[1] = -1000;
+	vertices[1].position[0] = 1000;
+	vertices[1].position[1] = -1000;
+	vertices[2].position[1] = 1000;
+	for (int i = 0; i < 3; i++) vertices[i].position[2] = 50;
+	ptTriangle_t triangle = {};
+	triangle.vertexIndices[1] = 1; triangle.vertexIndices[2] = 2;
+	triangle.flags = PT_TRI_OPAQUE;
+	ptBVHNode_t node = {};
+	node.leftChild = node.escapeIndex = -1;
+	node.bounds[0] = node.bounds[1] = node.bounds[2] = -1000;
+	node.bounds[3] = node.bounds[4] = node.bounds[5] = 1000;
+	const int index = 0;
+	ptMaterial_t material = {};
+	ptRng_t rng;
+	PT_RngInit(&rng, thread, 0);
+	float scattering[3];
+	PT_PhysicalSingleScattering(p, ray, 100, vertices, &triangle, &node, &index, &material,
+		NULL, &light, 1, &rng, scattering);
+	results[0] = scattering[0];
+	p.physicalFogAlbedo = 0;
+	PT_PhysicalSingleScattering(p, ray, 100, vertices, &triangle, &node, &index, &material,
+		NULL, &light, 1, &rng, scattering);
+	results[1] = scattering[0];
+	p.physicalFogAlbedo = 0.8f;
+	node.primitiveCount = 1;
+	PT_PhysicalSingleScattering(p, ray, 40, vertices, &triangle, &node, &index, &material,
+		NULL, &light, 1, &rng, scattering);
+	results[2] = scattering[0];
+	p.physicalFogDensity = 0;
+	const unsigned int state = rng.state;
+	PT_PhysicalSingleScattering(p, ray, 100, vertices, &triangle, &node, &index, &material,
+		NULL, &light, 1, &rng, scattering);
+	results[3] = scattering[0];
+	results[4] = state == rng.state;
+	p.physicalFogDensity = 0.2f;
+	p.physicalFogSteps = 1;
+	node.primitiveCount = 0;
+	ptLight_t lights[4];
+	for (int i = 0; i < 4; i++) { lights[i] = light; lights[i].intensity = (float)(1 << i); }
+	PT_PhysicalSingleScattering(p, ray, 100, vertices, &triangle, &node, &index, &material,
+		NULL, lights, 4, &rng, scattering);
+	results[5] = scattering[0];
 }
 
 int main() {
@@ -265,10 +506,40 @@ int main() {
 	}
 	CUDA_CHECK(availability);
 	CheckPathIntegration();
+	CheckTransmissionPaths();
 	const int count = 262144;
 	float* device = NULL;
 	CUDA_CHECK(cudaMalloc(&device, count * 4 * sizeof(float)));
 	std::vector<float> results(count * 4);
+	CheckTransportMath<<<1, 1>>>(p, device);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(results.data(), device, 15 * sizeof(float), cudaMemcpyDeviceToHost));
+	CheckNear("dielectric normal Fresnel", results[0], 0.04, 1e-6);
+	CheckNear("dielectric normal refraction", results[1], 1, 1e-6);
+	CheckNear("total internal reflection", results[2], 1, 0);
+	CheckNear("Snell law", results[4], std::sqrt(1 - 0.36 / 2.25), 1e-6);
+	CheckNear("Beer absorption", results[5], 0.5, 1e-6);
+	CheckNear("bounded fog transmittance", results[6], std::exp(-0.2), 1e-6);
+	CheckNear("outside fog sphere interval", results[7], 200, 1e-5);
+	CheckNear("outside fog sphere entry", results[8], 100, 1e-5);
+	CheckNear("fog miss does not attenuate", results[9], 1, 0);
+	CheckNear("forward scattering orientation", results[10], 1, 0);
+	CheckNear("thin glass shadow visibility", results[11], 1, 0);
+	CheckNear("absorbing sheet shadow energy", results[12], 0.7 * 0.96 * 0.96 * 0.5 / (1 - 0.04 * 0.04 * 0.25), 1e-6);
+	CheckNear("solid glass does not fake straight caustics", results[13], 0, 0);
+	CheckNear("diffuse sheet does not fake straight caustics", results[14], 0, 0);
+	const int scatterCount = 4096;
+	CheckScattering<<<scatterCount / 256, 256>>>(device);
+	CUDA_CHECK(cudaGetLastError());
+	CUDA_CHECK(cudaMemcpy(results.data(), device, scatterCount * 6 * sizeof(float), cudaMemcpyDeviceToHost));
+	CheckNear("analytic shadowed single scattering", results[0], 10 * 0.8 * 0.2 * std::exp(-0.2) / (4 * PT_PI), 1e-6);
+	CheckNear("pure absorbing fog has no scattering", results[1], 0, 0);
+	CheckNear("occluder blocks volumetric illumination", results[2], 0, 0);
+	CheckNear("disabled fog has no scattering", results[3], 0, 0);
+	CheckNear("disabled fog preserves RNG", results[4], 1, 0);
+	double scatterMean = 0;
+	for (int i = 0; i < scatterCount; i++) scatterMean += results[i * 6 + 5] / scatterCount;
+	CheckNear("bounded volumetric light reservoir is unbiased", scatterMean, 15 * 10 * 0.8 * 0.2 * std::exp(-0.2) / (4 * PT_PI), 0.02);
 	CheckLightModel<<<1, 1>>>(p, device);
 	CUDA_CHECK(cudaGetLastError());
 	CUDA_CHECK(cudaMemcpy(results.data(), device, 11 * sizeof(float), cudaMemcpyDeviceToHost));

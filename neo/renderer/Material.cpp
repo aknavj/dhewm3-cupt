@@ -116,6 +116,10 @@ void idMaterial::CommonInit() {
 	suppressInSubview = false;
 	refCount = 0;
 	portalSky = false;
+	memset( &physicalMaterial, 0, sizeof( physicalMaterial ) );
+	physicalMaterial.ior = 1.5f;
+	physicalMaterial.thickness = 0.005f;
+	physicalMaterial.roughness = physicalMaterial.metallic = -1.0f;
 
 	decalInfo.stayTime = 10000;
 	decalInfo.fadeTime = 4000;
@@ -1831,6 +1835,58 @@ void idMaterial::ParseMaterial( idLexer &src ) {
 			desc = token.c_str();
 			continue;
 		}
+		else if ( !token.Icmp( "ptMaterial" ) ) {
+			physicalMaterial.enabled = true;
+			if ( !src.ExpectTokenString( "{" ) ) {
+				SetMaterialFlag( MF_DEFAULTED );
+				return;
+			}
+			while ( src.ExpectAnyToken( &token ) && token != "}" ) {
+				float *value = NULL;
+				float minimum = 0.0f, maximum = 1.0f;
+				if ( !token.Icmp( "transmission" ) ) value = &physicalMaterial.transmission;
+				else if ( !token.Icmp( "ior" ) ) { value = &physicalMaterial.ior; minimum = 1.0f; maximum = 3.0f; }
+				else if ( !token.Icmp( "roughness" ) ) { value = &physicalMaterial.roughness; minimum = 0.04f; }
+				else if ( !token.Icmp( "metallic" ) ) value = &physicalMaterial.metallic;
+				else if ( !token.Icmp( "thickness" ) ) { value = &physicalMaterial.thickness; maximum = 100.0f; }
+				else if ( !token.Icmp( "thin" ) ) {
+					const float thin = src.ParseFloat();
+					if ( thin != 0.0f && thin != 1.0f && thin != 2.0f ) {
+						src.Warning( "ptMaterial thin must be 0 (solid), 1 (glass sheet), or 2 (diffuse sheet)" );
+						SetMaterialFlag( MF_DEFAULTED );
+						return;
+					}
+					physicalMaterial.thin = (int)thin;
+					continue;
+				} else if ( !token.Icmp( "absorption" ) ) {
+					for ( int c = 0; c < 3; c++ ) {
+						const float coefficient = src.ParseFloat();
+						if ( !( coefficient >= 0.0f && coefficient <= 1000000.0f ) ) {
+							src.Warning( "ptMaterial absorption must be finite and between 0 and 1000000 inverse meters" );
+							SetMaterialFlag( MF_DEFAULTED );
+							return;
+						}
+						physicalMaterial.absorption[c] = coefficient;
+					}
+					continue;
+				} else {
+					src.Warning( "unknown ptMaterial property '%s'", token.c_str() );
+					SetMaterialFlag( MF_DEFAULTED );
+					return;
+				}
+				*value = src.ParseFloat();
+				if ( !( *value >= minimum && *value <= maximum ) ) {
+					src.Warning( "ptMaterial %s must be between %g and %g", token.c_str(), minimum, maximum );
+					SetMaterialFlag( MF_DEFAULTED );
+					return;
+				}
+			}
+			if ( token != "}" || src.HadError() ) {
+				SetMaterialFlag( MF_DEFAULTED );
+				return;
+			}
+			continue;
+		}
 		// check for the surface / content bit flags
 		else if ( CheckSurfaceParm( &token ) ) {
 			continue;
@@ -2350,6 +2406,12 @@ static const char *opNames[] = {
 void idMaterial::Print() const {
 	int			i;
 
+	if ( physicalMaterial.enabled ) {
+		common->Printf( "ptMaterial: transmission=%g ior=%g thin=%d thickness=%g absorption=(%g %g %g) roughness=%g metallic=%g\n",
+			physicalMaterial.transmission, physicalMaterial.ior, physicalMaterial.thin, physicalMaterial.thickness,
+			physicalMaterial.absorption[0], physicalMaterial.absorption[1], physicalMaterial.absorption[2],
+			physicalMaterial.roughness, physicalMaterial.metallic );
+	}
 	for ( i = EXP_REG_NUM_PREDEFINED ; i < GetNumRegisters() ; i++ ) {
 		common->Printf( "register %i: %f\n", i, expressionRegisters[i] );
 	}

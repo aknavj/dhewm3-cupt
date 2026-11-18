@@ -13,6 +13,10 @@ extern idCVar r_ptDraw;
 extern idCVar r_ptMode;
 extern idCVar r_ptToneMapMode;
 extern idCVar r_ptDenoise;
+extern idCVar r_ptBloom;
+extern idCVar r_ptBloomThreshold;
+extern idCVar r_ptBloomRadius;
+extern idCVar r_ptLensFlare;
 
 static idCVar r_ptPhysicalMetersPerUnit( "r_ptPhysicalMetersPerUnit", "0.0254", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
 	"physical scale: meters per Doom unit (default assumes inches)", 0.001f, 1.0f );
@@ -42,6 +46,16 @@ static idCVar r_ptPhysicalFocusDistance( "r_ptPhysicalFocusDistance", "3", CVAR_
 	"focus plane distance in meters along camera forward", 0.25f, 1000.0f );
 static idCVar r_ptPhysicalDOF( "r_ptPhysicalDOF", "1", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_BOOL,
 	"thin-lens depth of field (off keeps photographic exposure with a pinhole)" );
+static idCVar r_ptPhysicalFogDensity( "r_ptPhysicalFogDensity", "0", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+	"homogeneous physical fog extinction in inverse meters (0 = off)", 0.0f, 10.0f );
+static idCVar r_ptPhysicalFogAlbedo( "r_ptPhysicalFogAlbedo", "0.9", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+	"physical fog scattering/extinction ratio", 0.0f, 1.0f );
+static idCVar r_ptPhysicalFogAnisotropy( "r_ptPhysicalFogAnisotropy", "0.3", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+	"physical fog Henyey-Greenstein anisotropy", -0.95f, 0.95f );
+static idCVar r_ptPhysicalFogRadius( "r_ptPhysicalFogRadius", "30", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_FLOAT,
+	"radius in meters of the camera-centered physical fog volume", 0.1f, 1000.0f );
+static idCVar r_ptPhysicalFogSteps( "r_ptPhysicalFogSteps", "16", CVAR_RENDERER | CVAR_ARCHIVE | CVAR_INTEGER,
+	"stratified physical single-scattering integration steps per segment", 1, 128 );
 
 static void PT_PhysicalPanel_f( const idCmdArgs &args ) {
 	using namespace D3::ImGuiHooks;
@@ -90,6 +104,11 @@ void R_PT_PhysicalParams( ptRenderParams_t &p ) {
 	p.fireflyClamp = 0.0f;
 	p.indirectProb = 0.0f;
 	p.volDensity = 0.0f;
+	p.physicalFogDensity = r_ptPhysicalFogDensity.GetFloat();
+	p.physicalFogAlbedo = r_ptPhysicalFogAlbedo.GetFloat();
+	p.physicalFogAnisotropy = r_ptPhysicalFogAnisotropy.GetFloat();
+	p.physicalFogRadius = r_ptPhysicalFogRadius.GetFloat() / p.physicalMetersPerUnit;
+	p.physicalFogSteps = r_ptPhysicalFogSteps.GetInteger();
 }
 
 static void PT_PhysicalSlider( const char *label, idCVar &var, float minimum, float maximum, const char *format, bool logarithmic = false ) {
@@ -142,6 +161,19 @@ void R_PT_DrawPhysicalPanel() {
 			ImGui::TextWrapped( "Doom 3 assets are not measured PBR data. Specular maps approximate roughness, not metalness. Legacy light volumes, boosts, firefly clamps and volumetrics are not used." );
 		}
 		int toneMap = r_ptToneMapMode.GetInteger();
+		if ( ImGui::CollapsingHeader( "Atmosphere and lens effects", ImGuiTreeNodeFlags_DefaultOpen ) ) {
+			PT_PhysicalSlider( "Bloom", r_ptBloom, 0, 1, "%.3f" );
+			PT_PhysicalSlider( "Highlight threshold", r_ptBloomThreshold, 0.01f, 100, "%.2f", true );
+			PT_PhysicalSlider( "Bloom radius / height", r_ptBloomRadius, 0.001f, 0.1f, "%.3f", true );
+			PT_PhysicalSlider( "Lens ghosts", r_ptLensFlare, 0, 1, "%.3f" );
+			PT_PhysicalSlider( "Fog extinction", r_ptPhysicalFogDensity, 0, 1, "%.4f /m" );
+			PT_PhysicalSlider( "Fog scattering albedo", r_ptPhysicalFogAlbedo, 0, 1, "%.2f" );
+			PT_PhysicalSlider( "Fog anisotropy", r_ptPhysicalFogAnisotropy, -0.95f, 0.95f, "%.2f" );
+			PT_PhysicalSlider( "Fog sphere radius", r_ptPhysicalFogRadius, 0.1f, 1000, "%.1f m", true );
+			int steps = r_ptPhysicalFogSteps.GetInteger();
+			if ( ImGui::SliderInt( "Fog integration steps", &steps, 1, 128 ) ) r_ptPhysicalFogSteps.SetInteger( steps );
+			ImGui::TextWrapped( "Fog is a bounded camera-centered homogeneous volume with shadowed single scattering, not multiple scattering. Lens ghosts are an artistic screen-space approximation. Effects default off." );
+		}
 		if ( ImGui::Combo( "Tone mapping", &toneMap, "Reinhard\0ACES\0Uncharted 2\0" ) ) r_ptToneMapMode.SetInteger( toneMap );
 		bool denoise = r_ptDenoise.GetBool();
 		if ( ImGui::Checkbox( "Denoise", &denoise ) ) r_ptDenoise.SetBool( denoise );
