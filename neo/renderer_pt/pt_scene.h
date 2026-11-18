@@ -66,7 +66,10 @@ public:
 
 	void					BeginFrame();
 	void					AddDrawSurface( const struct drawSurf_s *surf );
-	void					AddViewLight( const struct viewLight_s *vLight );
+	void					AddViewLight( const struct viewLight_s *vLight, bool physical = false );
+#ifdef PT_PHYSICAL
+	void					AddPhysicalLights( const struct viewDef_s *view );
+#endif
 	void					EndFrame();
 
 	const idList<ptVertex_t> &		Vertices() const { return vertices; }

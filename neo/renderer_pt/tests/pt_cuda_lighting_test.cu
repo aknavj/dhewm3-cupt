@@ -1,4 +1,7 @@
 #include "renderer_pt/cuda/pt_kernel_pathtracing.cuh"
+#include "renderer_pt/cuda/pt_kernel_triangles.cuh"
+#include "renderer_pt/cuda/pt_kernel_triangles_textured.cuh"
+#include "renderer_pt/cuda/pt_kernel_triangles_raytraced.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -394,6 +397,104 @@ static double TracePath(fixture_t& fixture, int maxDepth, int maxLightSamples, f
 	return total / pixels;
 }
 
+__global__ void CheckOverlayIndirect(
+	const ptVertex_t* vertices, const ptTriangle_t* triangles, const ptMaterial_t* materials,
+	const ptBVHNode_t* node, const int* indices, const cudaTexture_t* textures, float* result
+) {
+	const float position[3] = { 0.0f, 0.0f, 3.0f };
+	const float direction[3] = { 0.0f, 0.0f, -1.0f };
+	ptRng_t rng;
+	PT_RngInit(&rng, 0, 0);
+	SampleIndirectLight(position, direction, direction, 0, 1, false,
+		vertices, triangles, node, indices, materials, textures, NULL, 0, &rng, result);
+}
+
+static void CheckInverseDecals() {
+	fixture_t fixture;
+	for (int i = 0; i < 6; i++) {
+		fixture.vertices[i].position[0] *= 1000;
+		fixture.vertices[i].position[1] *= 1000;
+		fixture.vertices[i].position[2] = i < 3 ? 1.0f : 0.0f;
+	}
+	fixture.node.bounds[0] = fixture.node.bounds[1] = -100000;
+	fixture.node.bounds[3] = fixture.node.bounds[4] = 100000;
+	fixture.node.bounds[2] = 0;
+	fixture.node.bounds[5] = 1;
+	fixture.node.primitiveCount = 2;
+	fixture.triangles[0].flags = PT_TRI_NO_OCCLUDE;
+	fixture.triangles[1].flags = PT_TRI_OPAQUE;
+	ptMaterial_t& decal = fixture.materials[0];
+	decal.isAmbientOnly = decal.noShadows = 1;
+	decal.blendMode = PT_BLEND_MODULATE_INVERSE;
+	decal.albedoTexture = 0;
+	for (int c = 0; c < 3; c++) {
+		decal.emission[c] = 0;
+		fixture.materials[1].albedo[c] = 0;
+		fixture.materials[1].emission[c] = 0.3f + c * 0.2f;
+	}
+	ptRenderParams_t params = {};
+	params.width = params.height = params.samplesPerPixel = params.maxDepth = 1;
+	params.camPos[2] = 3;
+	params.camForward[2] = -1;
+	params.camUp[1] = params.camRight[0] = 1;
+	params.rayOffset = 0.0001f;
+	params.emissionBoost = 1;
+	float* device = Allocate<float>(4);
+	ptCudaDenoiseGuide_t* guide = Allocate<ptCudaDenoiseGuide_t>(1);
+	float result[4];
+	const unsigned char sources[][3] = { {0, 0, 0}, {0, 192, 255}, {128, 128, 128}, {255, 255, 255} };
+	for (const auto& source : sources) {
+		for (int vertexColor = 0; vertexColor < 2; vertexColor++) {
+			decal.useVertexColor = vertexColor;
+			const float stageTint = vertexColor ? 0.8f : 1.0f;
+			for (int i = 0; i < 3; i++) {
+				fixture.vertices[i].color[0] = fixture.vertices[i].color[1] = fixture.vertices[i].color[2] = 0.5f;
+			}
+			for (int c = 0; c < 3; c++) decal.albedo[c] = std::pow(stageTint, 2.2f);
+			for (int alpha : { 0, 255 }) {
+				for (int i = 0; i < 2; i++) {
+					for (int c = 0; c < 3; c++) fixture.texels[0][i * 4 + c] = source[c];
+					fixture.texels[0][i * 4 + 3] = alpha;
+				}
+				fixture.Upload();
+				CUDA_CHECK(cudaMemset(device, 0, 4 * sizeof(float)));
+				PathTracingKernel<<<1, 1>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_node, fixture.d_indices,
+					fixture.d_materials, fixture.d_textures, NULL, 0, device, params, NULL, guide);
+				CUDA_CHECK(cudaGetLastError());
+				CUDA_CHECK(cudaMemcpy(result, device, sizeof(result), cudaMemcpyDeviceToHost));
+				for (int c = 0; c < 3; c++) {
+					const double sourceGamma = source[c] / 255.0 * stageTint * (vertexColor ? 0.5 : 1);
+					const double expected = fixture.materials[1].emission[c] * std::pow(1 - sourceGamma, 2.2);
+					CheckNear("inverse decal primary composition ignores source alpha", result[c], expected, 2e-6);
+				}
+				ptCudaDenoiseGuide_t hostGuide;
+				CUDA_CHECK(cudaMemcpy(&hostGuide, guide, sizeof(hostGuide), cudaMemcpyDeviceToHost));
+				CheckNear("inverse decal uses raw progressive fallback", hostGuide.depth, 0, 0);
+				CheckOverlayIndirect<<<1, 1>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_materials,
+					fixture.d_node, fixture.d_indices, fixture.d_textures, device);
+				CUDA_CHECK(cudaGetLastError());
+				CUDA_CHECK(cudaMemcpy(result, device, sizeof(result), cudaMemcpyDeviceToHost));
+				for (int c = 0; c < 3; c++) {
+					const double sourceGamma = source[c] / 255.0 * stageTint * (vertexColor ? 0.5 : 1);
+					CheckNear("inverse decal indirect composition", result[c],
+						fixture.materials[1].emission[c] * std::pow(1 - sourceGamma, 2.2), 2e-6);
+				}
+				TriangleDrawRayTracedKernel<<<1, 1>>>(fixture.d_vertices, fixture.d_triangles, fixture.d_node, fixture.d_indices,
+					fixture.d_materials, fixture.d_textures, NULL, 0, device, params);
+				CUDA_CHECK(cudaGetLastError());
+				CUDA_CHECK(cudaMemcpy(result, device, sizeof(result), cudaMemcpyDeviceToHost));
+				for (int c = 0; c < 3; c++) {
+					const double sourceGamma = source[c] / 255.0 * stageTint * (vertexColor ? 0.5 : 1);
+					CheckNear("inverse decal Whitted composition", result[c],
+						fixture.materials[1].emission[c] * std::pow(1 - sourceGamma, 2.2), 2e-6);
+				}
+			}
+		}
+	}
+	CUDA_CHECK(cudaFree(device));
+	CUDA_CHECK(cudaFree(guide));
+}
+
 int main() {
 	int deviceCount = 0;
 	const cudaError_t deviceError = cudaGetDeviceCount(&deviceCount);
@@ -403,6 +504,7 @@ int main() {
 		return 77;
 	}
 	CUDA_CHECK(deviceError);
+	CheckInverseDecals();
 	const float rayOffset = 0.0001f;
 	CUDA_CHECK(cudaMemcpyToSymbol(g_rayOffset, &rayOffset, sizeof(rayOffset)));
 

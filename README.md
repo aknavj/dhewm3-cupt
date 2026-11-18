@@ -204,6 +204,108 @@ The lighting regression test also checks guide eligibility, multi-sample guide g
 fresh radiance independent of the progressive mean, unchanged raw accumulation, and
 diffuse/specular conservation for direct, indirect, emissive, clamped, and volumetric cases.
 
+### Decal blending
+
+Material overlays support ordinary and inverse-color multiplication in both
+path tracing and Whitted modes. Doom 3 blood decals use
+`blend gl_zero, gl_one_minus_src_color`: their cyan-on-black source image is a
+filter, not emitted color or an alpha-over layer. The renderer complements the
+gamma-encoded source before converting the filter to linear throughput, preserving
+the floor behind black texels and producing the intended red stain. Texture alpha
+does not control this blend; stage RGB and vertex-color modulation still apply.
+The same filter is applied to the single-bounce indirect estimator. Such overlays
+retain the raw progressive fallback rather than borrowing an opaque surface's
+denoising history.
+
+### Experimental physical rendering (`PT_PHYSICAL`)
+
+This is a separate, **default-OFF build-time rendering model**, not another
+quality preset. Build it with CUDA and the existing Dear ImGui integration:
+
+```sh
+cmake -S neo -B build-physical -DCUDA_PATHTRACER=ON -DIMGUI=ON -DPT_PHYSICAL=ON
+cmake --build build-physical -j2
+```
+
+The CUDA host-compiler compatibility notes above also apply to this build.
+Run the new executable in `build-physical/`, not an older executable in `neo/`.
+Game data and game libraries must be installed as for a normal engine build.
+Omitting `PT_PHYSICAL`, or setting it to `OFF`, retains the existing Doom 3-style
+path tracing. OpenGL is unchanged. In a physical build, path tracing mode
+(`r_ptDraw 1`, `r_ptMode 0`) always uses the experimental model; other diagnostic
+and Whitted modes retain their existing shading.
+
+The model provides:
+
+- Inverse-square point lighting in meters, lumen-based light stages, lux-based
+  directional lights, and normalized spotlight angular profiles. Legacy box/radius
+  attenuation and falloff textures no longer bound these lights. Spotlight gobos
+  remain angular filters and can reduce the transmitted flux.
+- All registered engine lights, with animated shader stages and view suppression,
+  rather than only lights passing Doom 3's light-volume visibility tests.
+- Reciprocal GGX specular with height-correlated Smith visibility, dielectric IOR,
+  Fresnel-attenuated diffuse, bounded reflectance, and diffuse/GGX mixture sampling
+  for indirect paths. Legacy specular brightness no longer invents metalness.
+- Emissive surface luminance in cd/m^2 (nits), shared consistently by visible
+  emission and sampled emissive triangles.
+- A photographic camera: `EV100 = log2(N^2 / t * 100 / ISO)` and
+  `exposure = 2^compensation / (1.2 * 2^EV100)`. The camera uses millimeter focal
+  length and sensor width, meter focus distance, and a uniformly sampled circular
+  thin lens. Sensor height follows the actual viewport aspect ratio. Lens FOV is
+  applied before engine culling, not only to traced rays.
+
+Run `r_ptPhysicalUI` in the console to toggle the ImGui tuning panel. For example,
+`bind F9 r_ptPhysicalUI` makes it accessible while playing. Existing ImGui mouse,
+keyboard, focus, and close-button handling apply. Controls persist as archived
+CVars and the panel locks its tuning controls during a capture; close it before
+recording a clean screenshot or sequence.
+
+| CVar | Default | Physical interpretation |
+|---|---|---|
+| `r_ptPhysicalMetersPerUnit` | `0.0254` | Meters per engine unit; assumes inches |
+| `r_ptPhysicalLightLumens` | `1500` | Flux represented by a unit-white engine light stage |
+| `r_ptPhysicalSunLux` | `50000` | Illuminance represented by a unit-white directional light |
+| `r_ptPhysicalEmissionNits` | `100` | Luminance represented by unit-white material emission |
+| `r_ptPhysicalIor` | `1.5` | Opaque dielectric IOR, giving F0 = 0.04 at the default |
+| `r_ptPhysicalRoughnessScale` | `1` | Scale for approximate legacy-map roughness |
+| `r_ptPhysicalISO` | `800` | Camera sensitivity |
+| `r_ptPhysicalShutter` | `0.03333333` | Exposure time in seconds (1/30 s) |
+| `r_ptPhysicalFNumber` | `2.8` | Aperture for both exposure and lens blur |
+| `r_ptPhysicalExposureCompensation` | `0` | Exposure compensation in stops |
+| `r_ptPhysicalFocalLength` | `35` | Focal length in mm |
+| `r_ptPhysicalSensorWidth` | `36` | Sensor width in mm |
+| `r_ptPhysicalFocusDistance` | `3` | Forward focus-plane distance in meters |
+| `r_ptPhysicalDOF` | `1` | Thin-lens blur; `0` selects a pinhole without changing exposure |
+
+Exposure/ISO/shutter changes preserve the scene-linear accumulated estimate.
+Focus, lens/aperture, material calibration, world scale, and lighting changes
+invalidate affected accumulation/history. DOF disables real-time temporal history:
+a pinhole reprojection cannot correctly reuse a stochastic lens sample. Spatial
+denoising remains available, and cinematic captures still accumulate and denoise
+all configured samples with the existing offline progressive path.
+
+This is **not a conversion to measured PBR assets**: the source materials and
+light stages have no calibrated units. Their RGB values and specular maps remain
+approximations; the calibration controls set their assumed physical scale.
+Placed point lights are ideal point sources (hard shadows); actual emissive
+triangles provide area-light soft shadows. Existing transparent/additive overlays,
+straight-through glass, geometry visibility/portal extraction, output gamma and
+tone mappers remain approximations inherited from the renderer. Surfaces outside
+the engine's extracted scene cannot reflect or occlude light. The physical lens
+overrides gameplay FOV, so this mode is especially suited to cinematic work.
+Shutter time does not provide motion blur. Participating media are not yet modeled:
+legacy volumetrics are disabled, as are artistic light/specular/emission boosts,
+the legacy single-bounce GI shortcut and biased radiance/firefly clamps.
+`r_ptSkyIntensity`, if enabled, is interpreted as environment luminance and
+illuminates secondary misses too; it is no longer only a backdrop.
+
+Physical builds include `pt_cuda_physical_test`; run
+`ctest --test-dir build-physical -R pt_cuda_physical --output-on-failure`.
+It checks exposure stops, lens units/FOV/focus and aperture distribution,
+inverse-square lighting and selection beyond old light volumes, unclamped direct
+light, spotlight normalization, BRDF reciprocity, and Monte Carlo energy bounds
+for diffuse/metallic materials from polished to rough and normal to grazing views.
+
 ## Console Commands
 
 | Command | Description |

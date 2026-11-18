@@ -330,6 +330,8 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
                 } else if ((srcBlend == GLS_SRCBLEND_DST_COLOR && dstBlend == GLS_DSTBLEND_ZERO)
                         || (srcBlend == GLS_SRCBLEND_ZERO && dstBlend == GLS_DSTBLEND_SRC_COLOR)) {
                     mat.blendMode = PT_BLEND_MODULATE;
+                } else if (srcBlend == GLS_SRCBLEND_ZERO && dstBlend == GLS_DSTBLEND_ONE_MINUS_SRC_COLOR) {
+                    mat.blendMode = PT_BLEND_MODULATE_INVERSE;
                 } else if (srcBlend != GLS_SRCBLEND_ONE || dstBlend != GLS_DSTBLEND_ZERO) {
                     // Non-opaque blend mode: check for additive variant (e.g. GL_SRC_ALPHA + GL_ONE)
                     if (dstBlend == GLS_DSTBLEND_ONE) {
@@ -362,6 +364,7 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
             bool isPremultAlpha = (ambSrc == GLS_SRCBLEND_ONE && ambDst == GLS_DSTBLEND_ONE_MINUS_SRC_ALPHA);
             bool isFilter = (ambSrc == GLS_SRCBLEND_DST_COLOR && ambDst == GLS_DSTBLEND_ZERO)
                          || (ambSrc == GLS_SRCBLEND_ZERO && ambDst == GLS_DSTBLEND_SRC_COLOR);
+            bool isInverseFilter = (ambSrc == GLS_SRCBLEND_ZERO && ambDst == GLS_DSTBLEND_ONE_MINUS_SRC_COLOR);
 
             if (isAdditive) {
                 mat.blendMode = PT_BLEND_ADD;
@@ -369,6 +372,8 @@ void idPathTracerScene::BuildMaterial( ptMaterial_t &mat, idVec3 &emission, cons
                 mat.blendMode = PT_BLEND_ALPHA;
             } else if (isFilter) {
                 mat.blendMode = PT_BLEND_MODULATE;
+            } else if (isInverseFilter) {
+                mat.blendMode = PT_BLEND_MODULATE_INVERSE;
             }
 
             // for blended surfaces, use the blend stage texture as albedo if we don't have one

@@ -65,6 +65,7 @@ option(TRACY		"Build and integrate the Tracy profiler, requires HARDLINK_GAME" O
 
 option(HARDLINK_GAME "Compile gamecode into executable (no game DLLs)" OFF)
 option(CUDA_PATHTRACER "Build with CUDA path tracer support" OFF)
+option(PT_PHYSICAL "Enable experimental physical path tracing and camera controls" OFF)
 option(PT_MATERIAL_CACHE_TESTS "Build the path tracer material cache regression test" OFF)
 option(PT_QUALITY_PRESET_TESTS "Build the path tracer quality preset regression test" OFF)
 option(PT_CUDA_LIGHTING_TESTS "Build the CUDA path tracer lighting regression test" OFF)
@@ -267,6 +268,14 @@ if(IMGUI)
 else()
 	message(STATUS "Dear ImGui integration disabled")
 	add_definitions(-DIMGUI_DISABLE)
+endif()
+
+if(PT_PHYSICAL)
+	if(NOT HAVE_CUDA OR NOT IMGUI)
+		message(FATAL_ERROR "PT_PHYSICAL requires CUDA_PATHTRACER=ON and IMGUI=ON with SDL2/SDL3")
+	endif()
+	add_definitions(-DPT_PHYSICAL)
+	message(STATUS "Experimental physical path tracing enabled")
 endif()
 
 if(DEFINED ENV{MSYSTEM})
@@ -698,6 +707,9 @@ if(HAVE_CUDA)
 		renderer_pt/pt_scene_material.cpp
 		renderer_pt/cuda/pt_backend_cuda.cpp
 	)
+	if(PT_PHYSICAL)
+		list(APPEND src_renderer renderer_pt/pt_physical.cpp)
+	endif()
 
 	list(APPEND src_renderer_pt_device
 		renderer_pt/cuda/pt_cuda_kernels.cu
@@ -1347,6 +1359,12 @@ if(PT_CUDA_DENOISING_TESTS)
 		renderer_pt/cuda/pt_cuda_kernels.cu)
 	add_test(pt_cuda_denoising pt_cuda_denoising_test)
 	set_tests_properties(pt_cuda_denoising PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(PT_PHYSICAL)
+	enable_testing()
+	add_executable(pt_cuda_physical_test renderer_pt/tests/pt_cuda_physical_test.cu)
+	add_test(pt_cuda_physical pt_cuda_physical_test)
+	set_tests_properties(pt_cuda_physical PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 if(SDL3)
 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h

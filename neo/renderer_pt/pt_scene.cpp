@@ -1,6 +1,9 @@
 #include "sys/platform.h"
 #include "renderer/tr_local.h"
 #include "renderer_pt/pt_scene.h"
+#ifdef PT_PHYSICAL
+#include "renderer/RenderWorld_local.h"
+#endif
 
 #include <new>
 
@@ -342,7 +345,7 @@ bool idPathTracerScene::AddEmissiveAreaLight( const ptVertex_t &v0, const ptVert
 idPathTracerScene::AddViewLight
 ========================
 */
-void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
+void idPathTracerScene::AddViewLight( const viewLight_t *vLight, bool physical ) {
 	if ( !vLight || !vLight->lightDef ) {
 		return;
 	}
@@ -359,7 +362,7 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 		return;
 	}
 
-	const float lightScale = Max( 0.0f, r_lightScale.GetFloat() );
+	const float lightScale = physical ? 1.0f : Max( 0.0f, r_lightScale.GetFloat() );
 	if ( lightScale == 0.0f ) {
 		return;
 	}
@@ -426,7 +429,7 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 		// Stage RGB already contains any shader-parameter expressions; alpha is not RGB intensity.
 		if ( parms.pointLight ) {
 			const float radius = ( parms.lightRadius.x + parms.lightRadius.y + parms.lightRadius.z ) / 3.0f;
-			AddLight( lightDef->globalLightOrigin, lightColor, idMath::PI, PT_LIGHT_POINT, radius, &projPlanes[0][0],
+			AddLight( lightDef->globalLightOrigin, lightColor, physical ? 1.0f : idMath::PI, PT_LIGHT_POINT, radius, &projPlanes[0][0],
 				lightImageIndex, falloffImageIndex, parms.lightRadius.ToFloatPtr(), textureTransform, textureAddress );
 		} else if ( parms.parallel ) {
 			idVec3 dir = parms.lightCenter;
@@ -434,7 +437,7 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 				dir = parms.target - parms.origin;
 			}
 			dir.Normalize();
-			AddLight( dir, lightColor, 10.0f, PT_LIGHT_DIRECTIONAL, 0.0f, NULL, -1, -1, NULL, textureTransform, textureAddress );
+			AddLight( dir, lightColor, physical ? 1.0f : 10.0f, PT_LIGHT_DIRECTIONAL, 0.0f, NULL, -1, -1, NULL, textureTransform, textureAddress );
 		} else {
 			const idVec3 worldTarget = parms.axis * parms.target;
 			const idVec3 worldRight = parms.axis * parms.right;
@@ -459,7 +462,7 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 			idVec3 upNorm = worldUp;
 			upNorm.Normalize();
 
-			AddSpotLight( parms.origin, lightDir, lightColor, idMath::PI, coneAngle, 2.0f, lightRange,
+			AddSpotLight( physical ? lightDef->globalLightOrigin : parms.origin, lightDir, lightColor, physical ? 1.0f : idMath::PI, coneAngle, 2.0f, lightRange,
 				&projPlanes[0][0], lightImageIndex, falloffImageIndex, rightNorm.ToFloatPtr(), upNorm.ToFloatPtr(),
 				textureTransform, textureAddress );
 		}
@@ -468,6 +471,30 @@ void idPathTracerScene::AddViewLight( const viewLight_t *vLight ) {
 		}
 	}
 }
+
+#ifdef PT_PHYSICAL
+void idPathTracerScene::AddPhysicalLights( const viewDef_t *view ) {
+	const idRenderWorldLocal *world = static_cast<const idRenderWorldLocal *>( view->renderWorld );
+	idList<float> registers;
+	for ( int i = 0; i < world->lightDefs.Num(); i++ ) {
+		idRenderLightLocal *light = world->lightDefs[i];
+		if ( !light || !light->lightShader ) continue;
+		const renderLight_t &parms = light->parms;
+		if ( !r_skipSuppress.GetBool()
+			&& ( ( parms.suppressLightInViewID && parms.suppressLightInViewID == view->renderView.viewID )
+				|| ( parms.allowLightInViewID && parms.allowLightInViewID != view->renderView.viewID ) ) ) continue;
+		viewLight_t snapshot = {};
+		snapshot.lightDef = light;
+		snapshot.lightShader = light->lightShader;
+		snapshot.falloffImage = light->falloffImage;
+		for ( int p = 0; p < 4; p++ ) snapshot.lightProject[p] = light->lightProject[p];
+		registers.SetNum( light->lightShader->GetNumRegisters(), false );
+		light->lightShader->EvaluateRegisters( registers.Ptr(), parms.shaderParms, view, parms.referenceSound );
+		snapshot.shaderRegisters = registers.Ptr();
+		AddViewLight( &snapshot, true );
+	}
+}
+#endif
 
 /*
 ========================

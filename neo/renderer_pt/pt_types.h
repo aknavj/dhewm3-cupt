@@ -49,7 +49,8 @@ enum ptBlendMode_t {
 	PT_BLEND_OPAQUE			= 0,
 	PT_BLEND_ALPHA			= 1,
 	PT_BLEND_ADD			= 2,
-	PT_BLEND_MODULATE		= 3
+	PT_BLEND_MODULATE		= 3,
+	PT_BLEND_MODULATE_INVERSE = 4	// dst * (1 - src), used by Doom 3 blood decals
 };
 
 enum ptRenderMode_t {
@@ -171,6 +172,15 @@ typedef struct {
 	float camUp[3];
 	float fovX;
 	float fovY;
+#ifdef PT_PHYSICAL
+	float physicalMetersPerUnit;
+	float physicalLightLumens;
+	float physicalSunLux;
+	float physicalIor;
+	float physicalRoughnessScale;
+	float physicalApertureRadius;	// world units; zero selects a pinhole
+	float physicalFocusDistance;	// world units, along camForward
+#endif
 
 	// trace resolution, must be <= the size passed to idPathTracerBackend::Resize
 	int width;

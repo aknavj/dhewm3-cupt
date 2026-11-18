@@ -65,6 +65,42 @@ __device__ void SampleHemisphere(
 	pdf = cosTheta / PT_PI;
 }
 
+#ifdef PT_PHYSICAL
+__device__ void PT_SamplePhysicalBsdf(
+	const float* normal, const float* wo, const float* albedo, float metallic, float roughness,
+	float ior, ptRng_t* rng, float* direction, float& pdf
+) {
+	const float probability = PT_PhysicalSpecularProbability(albedo, metallic, ior);
+	if (PT_Rand(rng) >= probability) {
+		SampleHemisphere(normal, rng, direction, pdf);
+	} else {
+		const float r = PT_Rand(rng);
+		const float phi = 2.0f * PT_PI * PT_Rand(rng);
+		const float alpha = roughness * roughness;
+		const float cosine = sqrtf((1.0f - r) / (1.0f + (alpha * alpha - 1.0f) * r));
+		const float sine = sqrtf(fmaxf(0.0f, 1.0f - cosine * cosine));
+		float axis[3] = { 0.0f, 0.0f, 0.0f };
+		axis[fabsf(normal[0]) < 0.9f ? 0 : 1] = 1.0f;
+		float tangent[3], bitangent[3], h[3];
+		cross3(axis, normal, tangent);
+		normalize3(tangent);
+		cross3(normal, tangent, bitangent);
+		for (int c = 0; c < 3; c++) {
+			h[c] = sine * cosf(phi) * tangent[c] + sine * sinf(phi) * bitangent[c] + cosine * normal[c];
+		}
+		const float vh = dot3(wo, h);
+		if (vh <= 0.0f) {
+			pdf = 0.0f;
+			direction[0] = direction[1] = direction[2] = 0.0f;
+			return;
+		}
+		for (int c = 0; c < 3; c++) direction[c] = 2.0f * vh * h[c] - wo[c];
+		normalize3(direction);
+	}
+	pdf = PT_PhysicalBsdfPdf(normal, wo, direction, roughness, probability);
+}
+#endif
+
 /*
 =================================================================================
 Henyey-Greenstein phase function for volumetric scattering
@@ -228,11 +264,45 @@ __device__ float PT_LightFilter(
 	float dist,
 	const float* toLight,
 	const cudaTexture_t* textures,
-	float* filter
+	float* filter,
+	const ptRenderParams_t* params = NULL
 ) {
 	filter[0] = light.color[0];
 	filter[1] = light.color[1];
 	filter[2] = light.color[2];
+
+#ifdef PT_PHYSICAL
+	if (PT_PhysicalActive(params)) {
+		if (light.type == PT_LIGHT_DIRECTIONAL) return params->physicalSunLux;
+		const float distanceMeters = dist * params->physicalMetersPerUnit;
+		float solidAngle = 4.0f * PT_PI;
+		float angular = 1.0f;
+		if (light.coneAngle > 0.0f) {
+			const float outer = cosf(light.coneAngle);
+			const float cosine = -dot3(toLight, light.direction);
+			const float exponent = fmaxf(light.coneFalloff, 0.0f);
+			angular = powf(clamp((cosine - outer) / fmaxf(1.0f - outer, 1e-6f), 0.0f, 1.0f), exponent);
+			if (cosine <= outer) return 0.0f;
+			solidAngle = 2.0f * PT_PI * (1.0f - outer) / (exponent + 1.0f);
+			if (light.projectedTextureIndex >= 0) {
+				const float (*lp)[4] = light.lightProject;
+				const float q = lp[2][0] * pos[0] + lp[2][1] * pos[1] + lp[2][2] * pos[2] + lp[2][3];
+				if (q <= 0.0f) return 0.0f;
+				const float s = (lp[0][0] * pos[0] + lp[0][1] * pos[1] + lp[0][2] * pos[2] + lp[0][3]) / q;
+				const float t = (lp[1][0] * pos[0] + lp[1][1] * pos[1] + lp[1][2] * pos[2] + lp[1][3]) / q;
+				if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f) return 0.0f;
+				if (textures) {
+					float tex[4];
+					const float* m = light.projectedTextureTransform;
+					SampleLightTextureSrgb(textures, light.projectedTextureIndex,
+						m[0] * s + m[1] * t + m[2], m[3] * s + m[4] * t + m[5], light.projectedTextureAddress, tex);
+					for (int c = 0; c < 3; c++) filter[c] *= tex[c];
+				}
+			}
+		}
+		return params->physicalLightLumens * angular / fmaxf(solidAngle * distanceMeters * distanceMeters, 1e-8f);
+	}
+#endif
 
 	if (light.type == PT_LIGHT_DIRECTIONAL) {
 		return 1.0f;
@@ -311,7 +381,8 @@ used to pick which lights get shadow rays. Zero only where the light can
 not contribute at all, so importance sampling stays unbiased.
 =================================================================================
 */
-__device__ float LightImportance(const ptLight_t& light, const float* pos, const float* normal, float emissionBoost) {
+__device__ float LightImportance(const ptLight_t& light, const float* pos, const float* normal, float emissionBoost,
+	const ptRenderParams_t* params = NULL) {
 	if (light.type == PT_LIGHT_AREA) {
 		const float power = (0.2126f * light.color[0] + 0.7152f * light.color[1] + 0.0722f * light.color[2])
 			* light.area[0] * emissionBoost;
@@ -335,6 +406,11 @@ __device__ float LightImportance(const ptLight_t& light, const float* pos, const
 	}
 
 	if (light.type == PT_LIGHT_DIRECTIONAL) {
+#ifdef PT_PHYSICAL
+		if (PT_PhysicalActive(params)) {
+			return power * params->physicalSunLux * (fmaxf(-dot3(normal, light.direction), 0.0f) + 0.02f);
+		}
+#endif
 		return power * (fmaxf(-dot3(normal, light.direction), 0.0f) + 0.02f);
 	}
 
@@ -343,6 +419,14 @@ __device__ float LightImportance(const ptLight_t& light, const float* pos, const
 	const float ndotl = dist > 1e-4f ? dot3(normal, d) / dist : 1.0f;
 	// soft lights may still reach slightly back facing points
 	const float cosTerm = fmaxf(ndotl, 0.0f) + 0.02f;
+
+#ifdef PT_PHYSICAL
+	if (PT_PhysicalActive(params)) {
+		const float wi[3] = { d[0] / fmaxf(dist, 1e-6f), d[1] / fmaxf(dist, 1e-6f), d[2] / fmaxf(dist, 1e-6f) };
+		float filter[3];
+		return power * cosTerm * PT_LightFilter(light, pos, dist, wi, NULL, filter, params);
+	}
+#endif
 
 	float shape;
 	if (light.boxFalloff) {
@@ -396,7 +480,8 @@ __device__ int PT_SelectLights(
 	float emissionBoost,
 	ptRng_t* rng,
 	int* picked,
-	float* invPdf
+	float* invPdf,
+	const ptRenderParams_t* params = NULL
 ) {
 	numPicks = min(numPicks, PT_MAX_LIGHT_PICKS);
 	if (numLights <= 0 || numPicks <= 0) {
@@ -406,7 +491,7 @@ __device__ int PT_SelectLights(
 	float pickedW[PT_MAX_LIGHT_PICKS];
 	float total = 0.0f;
 	for (int i = 0; i < numLights; i++) {
-		const float w = LightImportance(lights[i], pos, normal, emissionBoost);
+		const float w = LightImportance(lights[i], pos, normal, emissionBoost, params);
 		if (w <= 0.0f) {
 			continue;
 		}
@@ -562,7 +647,8 @@ __device__ void SampleDirectLight(
 	const cudaTexture_t* textures,
 	ptRng_t* rng,
 	float* radiance,
-	float* wi
+	float* wi,
+	const ptRenderParams_t* params = NULL
 ) {
 	radiance[0] = radiance[1] = radiance[2] = 0.0f;
 
@@ -582,6 +668,11 @@ __device__ void SampleDirectLight(
 				+ bary[2] * vertices[tri.vertexIndices[2]].position[c];
 		}
 	} else {
+#ifdef PT_PHYSICAL
+		if (PT_PhysicalActive(params)) {
+			for (int c = 0; c < 3; c++) lightPos[c] = light.position[c];
+		} else
+#endif
 		JitterLightPosition(light, rng, lightPos);
 	}
 
@@ -642,8 +733,13 @@ __device__ void SampleDirectLight(
 		}
 		contribution = ndotl * emitterCosine * light.area[0] / (distance * distance);
 	} else {
-		const float attenuation = PT_LightFilter(light, position, distance, wi, textures, lightColor);
+		const float attenuation = PT_LightFilter(light, position, distance, wi, textures, lightColor, params);
 		if (attenuation <= 0.0f) return;
+#ifdef PT_PHYSICAL
+		if (PT_PhysicalActive(params)) {
+			contribution = light.intensity * ndotl * attenuation;
+		} else
+#endif
 		contribution = fminf(light.intensity * ndotl * attenuation, 10.0f);
 	}
 
@@ -721,6 +817,7 @@ __device__ void SampleIndirectLight(
 
 	ptHitInfo_t hitInfo;
 	float albedo[4];
+	float modulation[3] = { 1.0f, 1.0f, 1.0f };
 	float tu = 0.0f, tv = 0.0f;
 	bool foundOpaque = false;
 
@@ -747,7 +844,11 @@ __device__ void SampleIndirectLight(
 		const bool decalOverlay = mat.noShadows && !mat.isAmbientOnly && mat.alphaTest == 0.0f
 			&& mat.transmission == 0.0f && mat.blendMode == PT_BLEND_OPAQUE;
 		const bool passThrough = decalOverlay || mat.isAmbientOnly || mat.transmission > 0.5f
-			|| mat.blendMode == PT_BLEND_ADD || (mat.alphaTest > 0.0f && albedo[3] < mat.alphaTest);
+			|| mat.blendMode == PT_BLEND_ADD || PT_IsModulation(mat.blendMode)
+			|| (mat.alphaTest > 0.0f && albedo[3] < mat.alphaTest);
+		if (PT_IsModulation(mat.blendMode) && !(mat.alphaTest > 0.0f && albedo[3] < mat.alphaTest)) {
+			for (int c = 0; c < 3; c++) modulation[c] *= PT_ModulationFactor(albedo[c], mat.blendMode);
+		}
 		if (!passThrough) {
 			foundOpaque = true;
 			break;
@@ -788,9 +889,9 @@ __device__ void SampleIndirectLight(
 
 	// clamp indirect
 	const float maxIndirect = 1.5f;
-	radiance[0] = fminf(radiance[0], maxIndirect);
-	radiance[1] = fminf(radiance[1], maxIndirect);
-	radiance[2] = fminf(radiance[2], maxIndirect);
+	radiance[0] = fminf(radiance[0] * modulation[0], maxIndirect);
+	radiance[1] = fminf(radiance[1] * modulation[1], maxIndirect);
+	radiance[2] = fminf(radiance[2] * modulation[2], maxIndirect);
 }
 
 #endif // __CU_RENDERER_SAMPLING_CUH__

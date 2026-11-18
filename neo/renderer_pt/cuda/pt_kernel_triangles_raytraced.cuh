@@ -229,13 +229,32 @@ __global__ void TriangleDrawRayTracedKernel(
 		float albB = mat.albedo[2];
 		float alpha = 1.0f;
 
+		if (mat.blendMode == PT_BLEND_MODULATE_INVERSE) PT_ApplyTexTransform(mat, tu, tv);
 		if (mat.albedoTexture >= 0) {
 			float texColor[4];
-			SampleTexture(textures, mat.albedoTexture, tu, tv, texColor);
+			if (mat.blendMode == PT_BLEND_MODULATE_INVERSE) {
+				SampleTextureSrgb(textures, mat.albedoTexture, tu, tv, texColor);
+			} else {
+				SampleTexture(textures, mat.albedoTexture, tu, tv, texColor);
+			}
 			albR *= texColor[0];
 			albG *= texColor[1];
 			albB *= texColor[2];
 			alpha = texColor[3];
+		}
+		if (mat.blendMode == PT_BLEND_MODULATE_INVERSE) {
+			float color[4] = { albR, albG, albB, alpha };
+			PT_ApplyVertexColor(mat, vertices, tri, w0, w1, w2, color);
+			throughR *= PT_ModulationFactor(color[0], mat.blendMode);
+			throughG *= PT_ModulationFactor(color[1], mat.blendMode);
+			throughB *= PT_ModulationFactor(color[2], mat.blendMode);
+			rayOrigX = pX + rayDirX * biasOffset;
+			rayOrigY = pY + rayDirY * biasOffset;
+			rayOrigZ = pZ + rayDirZ * biasOffset;
+			bounce--;
+			alphaSkips++;
+			if (alphaSkips >= MAX_ALPHA_SKIPS) break;
+			continue;
 		}
 
 		// alpha test: perforated surface fails — skip through

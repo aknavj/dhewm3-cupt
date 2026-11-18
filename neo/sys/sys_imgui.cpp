@@ -40,6 +40,9 @@
 #include "renderer/tr_local.h" // glconfig
 #include "ui/DeviceContext.h"
 #include "ui/UserInterface.h"
+#ifdef PT_PHYSICAL
+#include "renderer_pt/pt_physical.h"
+#endif
 
 extern void Com_DrawDhewm3SettingsMenu(); // in framework/dhewm3SettingsMenu.cpp
 extern void Com_OpenCloseDhewm3SettingsMenu( bool open ); // ditto
@@ -366,6 +369,11 @@ void NewFrame()
 	if (openImguiWindows & D3_ImGuiWin_Settings) {
 		Com_DrawDhewm3SettingsMenu();
 	}
+#ifdef PT_PHYSICAL
+	if (openImguiWindows & D3_ImGuiWin_PhysicalPT) {
+		R_PT_DrawPhysicalPanel();
+	}
+#endif
 
 	if (openImguiWindows & D3_ImGuiWin_Demo) {
 		bool show_demo_window = true;

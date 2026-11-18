@@ -5,6 +5,44 @@
 #include <device_launch_parameters.h>
 #include "renderer_pt/cuda/pt_cuda_device.h"
 #include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_physical.cuh"
+
+__device__ inline bool PT_IsModulation(int blendMode) {
+	return blendMode == PT_BLEND_MODULATE || blendMode == PT_BLEND_MODULATE_INVERSE;
+}
+
+__device__ inline float PT_ModulationFactor(float linearSource, int blendMode) {
+	if (blendMode != PT_BLEND_MODULATE_INVERSE) return linearSource;
+	// Legacy framebuffer blending complements the gamma-encoded source, not linear radiance.
+	const float source = powf(fmaxf(linearSource, 0.0f), 1.0f / 2.2f);
+	return PT_SrgbToLinear(fmaxf(0.0f, 1.0f - source));
+}
+
+__device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& material, float& tu, float& tv) {
+	const float* xf = material.texTransform;
+	if (xf[0] == 1.0f && xf[1] == 0.0f && xf[2] == 0.0f
+		&& xf[3] == 0.0f && xf[4] == 1.0f && xf[5] == 0.0f) {
+		return;
+	}
+	const float u = xf[0] * tu + xf[1] * tv + xf[2];
+	const float v = xf[3] * tu + xf[4] * tv + xf[5];
+	tu = u - floorf(u);
+	tv = v - floorf(v);
+}
+
+__device__ __forceinline__ void PT_ApplyVertexColor(
+	const ptMaterial_t& material, const ptVertex_t* vertices, const ptTriangle_t& tri,
+	float w, float u, float v, float* color
+) {
+	if (!material.useVertexColor) return;
+	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+	for (int c = 0; c < 4; c++) {
+		const float vertexColor = w * v0.color[c] + u * v1.color[c] + v * v2.color[c];
+		color[c] *= c < 3 ? PT_SrgbToLinear(vertexColor) : vertexColor;
+	}
+}
 
 /*
 =================================================================================
@@ -176,8 +214,15 @@ __device__ void EvaluatePBRMaterial(
 	float specularBoost,  // Doom 3 interaction shader doubles specular
 	const float* specColor,  // specular tint from specular map
 	float* brdf,
-	float* diffuseBrdf = NULL
+	float* diffuseBrdf = NULL,
+	const ptRenderParams_t* params = NULL
 ) {
+#ifdef PT_PHYSICAL
+	if (PT_PhysicalActive(params)) {
+		PT_EvaluatePhysicalMaterial(albedo, normal, wo, wi, metallic, roughness, params->physicalIor, brdf, diffuseBrdf);
+		return;
+	}
+#endif
 	float NdotL = fmaxf(0.0f, dot3(normal, wi));
 	float NdotV = fmaxf(0.0f, dot3(normal, wo));
 

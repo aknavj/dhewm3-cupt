@@ -38,6 +38,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/RenderWorld_local.h"
 
 #include "renderer/tr_local.h"
+#ifdef PT_PHYSICAL
+#include "renderer_pt/pt_physical.h"
+#endif
 
 //====================================================================
 
@@ -1107,6 +1110,9 @@ void R_RenderView( viewDef_t *parms ) {
 	tr.viewDef = parms;
 
 	tr.sortOffset = 0;
+#ifdef PT_PHYSICAL
+	R_PT_PhysicalCamera( parms );
+#endif
 
 	// set the matrix for world space to eye space
 	R_SetViewMatrix( tr.viewDef );

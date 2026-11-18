@@ -200,39 +200,6 @@ __device__ bool IntersectBVH(
 
 /*
 =================================================================================
-PT_ApplyTexTransform
-=================================================================================
-*/
-__device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& material, float& tu, float& tv) {
-	const float* xf = material.texTransform;
-	if (xf[0] == 1.0f && xf[1] == 0.0f && xf[2] == 0.0f
-		&& xf[3] == 0.0f && xf[4] == 1.0f && xf[5] == 0.0f) {
-		return;
-	}
-	const float u = xf[0] * tu + xf[1] * tv + xf[2];
-	const float v = xf[3] * tu + xf[4] * tv + xf[5];
-	tu = u;
-	tv = v;
-	tu = tu - floorf(tu);
-	tv = tv - floorf(tv);
-}
-
-__device__ __forceinline__ void PT_ApplyVertexColor(
-	const ptMaterial_t& material, const ptVertex_t* vertices, const ptTriangle_t& tri,
-	float w, float u, float v, float* color
-) {
-	if (!material.useVertexColor) return;
-	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
-	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
-	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
-	for (int c = 0; c < 4; c++) {
-		const float vertexColor = w * v0.color[c] + u * v1.color[c] + v * v2.color[c];
-		color[c] *= c < 3 ? PT_SrgbToLinear(vertexColor) : vertexColor;
-	}
-}
-
-/*
-=================================================================================
 PT_ShadowTransmit
 
 Filters a shadow ray through a non-opaque surface. Returns false when the
@@ -423,6 +390,9 @@ __global__ void PathTracingKernel(
 		ray.direction[1] = cameraForward[1] + u * cameraRight[1] * tanHalfFovX + v * cameraUp[1] * tanHalfFovY;
 		ray.direction[2] = cameraForward[2] + u * cameraRight[2] * tanHalfFovX + v * cameraUp[2] * tanHalfFovY;
 		normalize3(ray.direction);
+#ifdef PT_PHYSICAL
+		if (PT_PhysicalActive(&params)) PT_PhysicalLens(params, &rng, ray.origin, ray.direction);
+#endif
 
 		ray.tMin = rayOffset;
 		ray.tMax = 1e10f;
@@ -450,7 +420,11 @@ __global__ void PathTracingKernel(
 
 			if (!IntersectBVH(ray, vertices, triangles, bvhNodes, triIndices, materials, hitInfo)) {
 				// sky dome - primary rays only (bounce misses return black for Doom 3 darkness)
-				if (depth == 0 && skyIntensity > 0.0f) {
+				if ((depth == 0
+#ifdef PT_PHYSICAL
+					|| PT_PhysicalActive(&params)
+#endif
+					) && skyIntensity > 0.0f) {
 					float upDot = ray.direction[2];
 					float skyColor[3];
 					if (upDot > 0.0f) {
@@ -570,6 +544,9 @@ __global__ void PathTracingKernel(
 
 				float specLum = specularMap[0] * 0.2126f + specularMap[1] * 0.7152f + specularMap[2] * 0.0722f;
 				roughness *= (1.0f - specLum * 0.6f);
+#ifdef PT_PHYSICAL
+				if (!PT_PhysicalActive(&params))
+#endif
 				metallic = fmaxf(metallic, specLum * 0.3f);
 				metallic = fminf(1.0f, fmaxf(0.0f, metallic));
 				roughness = fminf(1.0f, fmaxf(0.01f, roughness));
@@ -580,6 +557,13 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			PT_ApplyVertexColor(material, vertices, triangles[hitInfo.triangleIndex],
 				hitInfo.barycentrics[0], hitInfo.barycentrics[1], hitInfo.barycentrics[2], albedo);
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params)) {
+				for (int c = 0; c < 3; c++) albedo[c] = clamp(albedo[c], 0.0f, 1.0f);
+				metallic = clamp(material.metallic, 0.0f, 1.0f);
+				roughness = clamp(roughness * params.physicalRoughnessScale, 0.04f, 1.0f);
+			}
+#endif
 
 			// ---------------------------------------------------------------
 			// Alpha test: skip transparent fragments
@@ -616,12 +600,20 @@ __global__ void PathTracingKernel(
 						sampleGuide.albedo[c] = fmaxf(0.04f, albedo[c] * (1.0f - metallic));
 						const float f0 = 0.04f * (1.0f - metallic) + albedo[c] * metallic;
 						sampleGuide.specularAlbedo[c] = fmaxf(0.01f, f0 * specularBoost * specColor[c]);
+#ifdef PT_PHYSICAL
+						if (PT_PhysicalActive(&params)) {
+							sampleGuide.specularAlbedo[c] = fmaxf(0.01f, PT_PhysicalF0(albedo[c], metallic, params.physicalIor));
+						}
+#endif
 						cameraDelta[c] = hitInfo.position[c] - cameraPos[c];
 					}
 					sampleGuide.depth = dot3(cameraDelta, cameraForward);
 					sampleGuide.roughness = fminf(1.0f, fmaxf(0.04f, roughness));
 					sampleGuide.materialIndex = hitInfo.materialIndex;
 					sampleGuide.historyValid = (hitInfo.triFlags & (PT_TRI_NO_HISTORY | PT_TRI_WEAPON)) == 0;
+#ifdef PT_PHYSICAL
+					if (params.physicalApertureRadius > 0.0f) sampleGuide.historyValid = 0;
+#endif
 					sampleGuide.coverage = sampleGuide.historyValid ? PT_DENOISE_STATIC : PT_DENOISE_DYNAMIC;
 				}
 			}
@@ -647,12 +639,15 @@ __global__ void PathTracingKernel(
 				int picks[PT_MAX_LIGHT_PICKS];
 				float pickWeights[PT_MAX_LIGHT_PICKS];
 				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
-					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights, &params);
 				for (int i = 0; i < numPicks; i++) {
 					float directLight[3], wi[3];
 					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
-						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
-					const float w = alpha * pickWeights[i];
+						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi, &params);
+					float w = alpha * pickWeights[i];
+#ifdef PT_PHYSICAL
+					if (PT_PhysicalActive(&params)) w /= PT_PI;
+#endif
 					pathRadiance[0] += pathThroughput[0] * directLight[0] * albedo[0] * w;
 					pathRadiance[1] += pathThroughput[1] * directLight[1] * albedo[1] * w;
 					pathRadiance[2] += pathThroughput[2] * directLight[2] * albedo[2] * w;
@@ -684,11 +679,9 @@ __global__ void PathTracingKernel(
 					pathRadiance[0] += pathThroughput[0] * albedo[0] * alpha;
 					pathRadiance[1] += pathThroughput[1] * albedo[1] * alpha;
 					pathRadiance[2] += pathThroughput[2] * albedo[2] * alpha;
-				} else if (material.blendMode == 3) {
+				} else if (PT_IsModulation(material.blendMode)) {
 					// modulate
-					pathThroughput[0] *= albedo[0];
-					pathThroughput[1] *= albedo[1];
-					pathThroughput[2] *= albedo[2];
+					for (int c = 0; c < 3; c++) pathThroughput[c] *= PT_ModulationFactor(albedo[c], material.blendMode);
 				} else {
 					// default alpha-over
 					pathRadiance[0] += pathThroughput[0] * albedo[0] * alpha;
@@ -718,11 +711,9 @@ __global__ void PathTracingKernel(
 				ray.origin[2] = hitInfo.position[2] + ray.direction[2] * rayOffset;
 				ray.tMin = rayOffset;
 				continue;  // additive overlay — does NOT increment depth
-			} else if (material.blendMode == 3) {
+			} else if (PT_IsModulation(material.blendMode)) {
 				// modulate
-				pathThroughput[0] *= albedo[0];
-				pathThroughput[1] *= albedo[1];
-				pathThroughput[2] *= albedo[2];
+				for (int c = 0; c < 3; c++) pathThroughput[c] *= PT_ModulationFactor(albedo[c], material.blendMode);
 				ray.origin[0] = hitInfo.position[0] + ray.direction[0] * rayOffset;
 				ray.origin[1] = hitInfo.position[1] + ray.direction[1] * rayOffset;
 				ray.origin[2] = hitInfo.position[2] + ray.direction[2] * rayOffset;
@@ -776,13 +767,13 @@ __global__ void PathTracingKernel(
 				int picks[PT_MAX_LIGHT_PICKS];
 				float pickWeights[PT_MAX_LIGHT_PICKS];
 				const int numPicks = PT_SelectLights(lights, numLights, hitInfo.position, surfaceNormal,
-					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights);
+					min(numLights, maxLightSamples), emissionBoost, &rng, picks, pickWeights, &params);
 				sampledLights = numPicks > 0;
 
 				for (int i = 0; i < numPicks; i++) {
 					float directLight[3], wi[3];
 					SampleDirectLight(lights[picks[i]], hitInfo.position, surfaceNormal, shadeWorldTMin, emissionBoost,
-						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi);
+						vertices, triangles, bvhNodes, triIndices, materials, textures, &rng, directLight, wi, &params);
 					if (directLight[0] + directLight[1] + directLight[2] <= 0.0f) {
 						continue;
 					}
@@ -792,7 +783,7 @@ __global__ void PathTracingKernel(
 						float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 						float directBrdf[3], diffuseBrdf[3];
 						EvaluatePBRMaterial(albedo, surfaceNormal, wo, wi, metallic, roughness, specularBoost, specColor,
-							directBrdf, diffuseBrdf);
+							directBrdf, diffuseBrdf, &params);
 
 						float alphaScale = (material.blendMode == PT_BLEND_ALPHA) ? albedo[3] : 1.0f;
 						pathRadiance[0] += pathThroughput[0] * directLight[0] * directBrdf[0] * alphaScale * lightWeight;
@@ -866,7 +857,7 @@ __global__ void PathTracingKernel(
 						float NdotL_indirect = fmaxf(0.0f, dot3(surfaceNormal, indirectDir));
 
 						EvaluatePBRMaterial(albedo, surfaceNormal, wo, indirectDir, metallic, roughness, specularBoost,
-							specColor, indirectBrdf, diffuseBrdf);
+							specColor, indirectBrdf, diffuseBrdf, &params);
 
 						float indirectScale = NdotL_indirect / (indirectProb * indirectPdf);
 						if (indirectScale > 10.0f) indirectScale = 10.0f;
@@ -957,18 +948,27 @@ __global__ void PathTracingKernel(
 			// ---------------------------------------------------------------
 			float nextDir[3];
 			float pdf;
+			float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params)) {
+				PT_SamplePhysicalBsdf(surfaceNormal, wo, albedo, metallic, roughness, params.physicalIor, &rng, nextDir, pdf);
+			} else
+#endif
 			SampleHemisphere(surfaceNormal, &rng, nextDir, pdf);
 
+#ifdef PT_PHYSICAL
+			if (PT_PhysicalActive(&params) ? pdf <= 0.0f : pdf < 1e-6f) break;
+#else
 			if (pdf < 1e-6f) break;
+#endif
 
 			// update throughput with PBR BRDF
 			float brdf[3], diffuseBrdf[3] = {};
-			float wo[3] = { -ray.direction[0], -ray.direction[1], -ray.direction[2] };
 			float NdotL_bounce = fmaxf(0.0f, dot3(surfaceNormal, nextDir));
 
 			if (material.blendMode == 0 || material.blendMode == 1) {
 				EvaluatePBRMaterial(albedo, surfaceNormal, wo, nextDir, metallic, roughness, specularBoost, specColor,
-					brdf, diffuseBrdf);
+					brdf, diffuseBrdf, &params);
 			} else {
 				EvaluateMaterial(albedo, surfaceNormal, wo, nextDir, brdf);
 			}

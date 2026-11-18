@@ -8,6 +8,7 @@
 #include "renderer_pt/pt_quality_preset.h"
 #include "renderer_pt/pt_render.h"
 #include "renderer_pt/pt_scene.h"
+#include "renderer_pt/pt_physical.h"
 
 /*
 ===============================================================================
@@ -351,6 +352,9 @@ Called once from R_InitCommands, not on every vid_restart.
 */
 void R_PT_InitCommands( void ) {
 	PT_InitQualityPresets();
+#ifdef PT_PHYSICAL
+	R_PT_InitPhysical();
+#endif
 	cmdSystem->AddCommand( "r_ptInfo", PT_Info_f, CMD_FL_RENDERER, "prints path tracer backend information" );
 	cmdSystem->AddCommand( "r_ptReset", PT_Reset_f, CMD_FL_RENDERER, "restarts accumulation and drops cached materials / textures" );
 	cmdSystem->AddCommand( "r_ptCompare", R_PT_Compare_f, CMD_FL_RENDERER, "saves an OpenGL and a converged path traced screenshot of the current view" );
@@ -460,6 +464,9 @@ static void PT_SetupParams( ptRenderParams_t &p, const viewDef_t *viewDef, int t
 	p.exposure = Max( 0.001f, r_ptExposure.GetFloat() );
 	p.gamma = r_ptGamma.GetFloat();
 	p.toneMapMode = r_ptToneMapMode.GetInteger();
+#ifdef PT_PHYSICAL
+	R_PT_PhysicalParams( p );
+#endif
 }
 
 /*
@@ -493,6 +500,9 @@ PT_ViewChanged
 ========================
 */
 static bool PT_TraceSettingsChanged( const ptRenderParams_t &a, const ptRenderParams_t &b ) {
+#ifdef PT_PHYSICAL
+	if ( PT_PhysicalTraceChanged( a, b ) ) return true;
+#endif
 	for ( int i = 0; i < 3; i++ ) {
 		if ( a.skyZenith[i] != b.skyZenith[i] || a.skyHorizon[i] != b.skyHorizon[i] || a.skyGround[i] != b.skyGround[i] ) return true;
 	}
@@ -636,8 +646,15 @@ bool RB_PT_DrawView( void ) {
 		for ( int i = 0; i < viewDef->numDrawSurfs; i++ ) {
 			pt.scene->AddDrawSurface( viewDef->drawSurfs[i] );
 		}
-		for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
-			pt.scene->AddViewLight( vLight );
+#ifdef PT_PHYSICAL
+		if ( PT_PhysicalActive( &params ) ) {
+			pt.scene->AddPhysicalLights( viewDef );
+		} else
+#endif
+		{
+			for ( const viewLight_t *vLight = viewDef->viewLights; vLight; vLight = vLight->next ) {
+				pt.scene->AddViewLight( vLight );
+			}
 		}
 		pt.scene->EndFrame();
 		const bool uploaded = pt.backend->UploadScene( *pt.scene );
