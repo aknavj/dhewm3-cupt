@@ -871,9 +871,9 @@ void R_InitOpenGL( void ) {
 	r_renderer.SetModified();
 	tr.SetBackEndRenderer();
 
-#ifdef HAVE_CUDA
-	// initialize CUDA path tracer if enabled
-	RB_CUDA_Init();
+#ifdef HAVE_PATHTRACER
+	// the backend itself is created lazily on the first frame with r_ptDraw 1
+	RB_PT_Init();
 #endif
 
 	// allocate the frame data, which may be more if smp is enabled
@@ -2284,6 +2284,11 @@ R_InitCommands
 =================
 */
 void R_InitCommands( void ) {
+	cmdSystem->AddCommand( "r_glSequence", R_GLSequence_f, CMD_FL_RENDERER, "renders a range of demo frames with OpenGL and saves them as screenshots" );
+	cmdSystem->AddCommand( "r_glAbort", R_GLAbort_f, CMD_FL_RENDERER, "aborts r_glSequence" );
+#ifdef HAVE_PATHTRACER
+	R_PT_InitCommands();
+#endif
 	cmdSystem->AddCommand( "MakeMegaTexture", idMegaTexture::MakeMegaTexture_f, CMD_FL_RENDERER|CMD_FL_CHEAT, "processes giant images" );
 	cmdSystem->AddCommand( "sizeUp", R_SizeUp_f, CMD_FL_RENDERER, "makes the rendered view larger" );
 	cmdSystem->AddCommand( "sizeDown", R_SizeDown_f, CMD_FL_RENDERER, "makes the rendered view smaller" );
@@ -2505,6 +2510,11 @@ idRenderSystemLocal::ShutdownOpenGL
 ========================
 */
 void idRenderSystemLocal::ShutdownOpenGL( void ) {
+
+#ifdef HAVE_PATHTRACER
+	// releases the backend and its GL blit texture while the context still exists
+	RB_PT_Shutdown();
+#endif
 
 	R_ShutdownFrameData();
 

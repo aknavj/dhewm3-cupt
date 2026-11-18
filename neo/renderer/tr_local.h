@@ -1306,21 +1306,23 @@ void RB_BakeTextureMatrixIntoTexgen( idPlane lightProject[3], const float textur
 /*
 ============================================================
 
-DRAW_CUDA
+DRAW_PATHTRACER (renderer_pt/)
 
 ============================================================
 */
 
-#ifdef HAVE_CUDA
-	void RB_CUDA_Init( void );
-	void RB_CUDA_Shutdown( void );
-	void RB_CUDA_DrawView( void );
+#ifdef HAVE_PATHTRACER
+	void RB_PT_Init( void );				// called after the GL context is (re)created
+	void RB_PT_Shutdown( void );			// called before the GL context is destroyed
+	bool RB_PT_IsActive( void );			// r_ptDraw is set and a backend is usable
+	bool RB_PT_DrawView( void );			// false when the view must be drawn with OpenGL
+	void R_PT_InitCommands( void );
 
-	void RB_CUDA_CompareCheck( void );
-	void RB_CUDA_SequenceCheck( void );
+	void RB_PT_CompareCheck( void );
+	void RB_PT_SequenceCheck( void );
 #endif
 
-// OpenGL sequence renderer (no CUDA dependency)
+// OpenGL sequence renderer (always available)
 void	R_GLSequence_f( const idCmdArgs &args );
 void	R_GLAbort_f( const idCmdArgs &args );
 void	RB_GLSequenceCheck( void );

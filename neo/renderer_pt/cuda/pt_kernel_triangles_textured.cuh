@@ -3,11 +3,10 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <device_launch_parameters.h>
-#include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
-#include "renderer_cuda/cu_renderer_material.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_material.cuh"
 
 /*
 ========================
@@ -18,8 +17,8 @@ Möller-Trumbore with barycentric output, returns t (or -1 on miss)
 __device__ __forceinline__ float IntersectTriangleUV_Simple(
 	float origX, float origY, float origZ,
 	float dirX, float dirY, float dirZ,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t& tri,
+	const ptVertex_t* vertices,
+	const ptTriangle_t& tri,
 	float& outU, float& outV
 ) {
 	const float* v0 = vertices[tri.vertexIndices[0]].position;
@@ -60,48 +59,20 @@ __device__ __forceinline__ float IntersectTriangleUV_Simple(
 TriangleDrawTexturedKernel
 ========================
 */
-__global__ __forceinline__ void TriangleDrawTexturedKernel(
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+__global__ void TriangleDrawTexturedKernel(
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	int width,
-	int height,
-	const float* cameraPos,
-	const float* cameraForward,
-	const float* cameraRight,
-	const float* cameraUp,
-	float fov,
-	float fovY,
-	int samplesPerPixel,
-	int maxDepth,
-	int maxLightSamples,
-	int frameIndex,
-	float emissionBoost,
-	float indirectProb,
-	int rrEnabled,
-	int rrMinBounces,
-	float rrSurvivalMin,
-	float earlyTermThreshold,
-	float fireflyClamp,
-	float throughputClamp,
-	float rayOffset,
-	float specularBoost,
-	float skyIntensity,
-	const float* skyColorZenith,
-	const float* skyColorHorizon,
-	const float* skyColorGround,
-	float volumetricDensity,
-	int volumetricSteps,
-	float volumetricAnisotropy,
-	float volFalloff,
-	float volMaxDist
+	int texSubMode,
+	const ptRenderParams_t params
 ) {
+	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -111,8 +82,7 @@ __global__ __forceinline__ void TriangleDrawTexturedKernel(
 
 	int pixelIndex = (y * width + x) * 4;
 
-	// sub-mode is passed via maxLightSamples
-	int subMode = maxLightSamples;
+	const int subMode = texSubMode;
 
 	// generate primary ray
 	float halfTanX = tanf(fov * 0.5f * 3.14159265f / 180.0f);
@@ -144,16 +114,12 @@ __global__ __forceinline__ void TriangleDrawTexturedKernel(
 	float hitU = 0.0f;
 	float hitV = 0.0f;
 
-	int stack[64];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
-
-	while (stackPtr > 0) {
-		int nodeIdx = stack[--stackPtr];
-		const cudaBVHNode_t& node = bvhNodes[nodeIdx];
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = bvhNodes[nodeIdx];
 
 		if (!IntersectAABB_Simple(origX, origY, origZ, invDirX, invDirY, invDirZ,
 								  node.bounds, nearestT)) {
+			nodeIdx = node.escapeIndex;
 			continue;
 		}
 
@@ -173,13 +139,9 @@ __global__ __forceinline__ void TriangleDrawTexturedKernel(
 					hitV = bv;
 				}
 			}
+			nodeIdx = node.escapeIndex;
 		} else {
-			if (node.leftChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.leftChild;
-			}
-			if (node.rightChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.rightChild;
-			}
+			nodeIdx = node.leftChild;
 		}
 	}
 
@@ -187,7 +149,7 @@ __global__ __forceinline__ void TriangleDrawTexturedKernel(
 	float r, g, b;
 
 	if (hitTriIdx >= 0) {
-		const cudaTriangle_t& tri = triangles[hitTriIdx];
+		const ptTriangle_t& tri = triangles[hitTriIdx];
 		int i0 = tri.vertexIndices[0];
 		int i1 = tri.vertexIndices[1];
 		int i2 = tri.vertexIndices[2];
@@ -200,7 +162,7 @@ __global__ __forceinline__ void TriangleDrawTexturedKernel(
 		float tu = w0 * vertices[i0].texcoord[0] + w1 * vertices[i1].texcoord[0] + w2 * vertices[i2].texcoord[0];
 		float tv = w0 * vertices[i0].texcoord[1] + w1 * vertices[i1].texcoord[1] + w2 * vertices[i2].texcoord[1];
 
-		const cudaMaterial_t& mat = materials[tri.materialIndex];
+		const ptMaterial_t& mat = materials[tri.materialIndex];
 
 		if (subMode == 1) {
 			// base color only

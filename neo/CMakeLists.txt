@@ -65,6 +65,11 @@ option(TRACY		"Build and integrate the Tracy profiler, requires HARDLINK_GAME" O
 
 option(HARDLINK_GAME "Compile gamecode into executable (no game DLLs)" OFF)
 option(CUDA_PATHTRACER "Build with CUDA path tracer support" OFF)
+option(PT_PHYSICAL "Enable experimental physical path tracing and camera controls" OFF)
+option(PT_MATERIAL_CACHE_TESTS "Build the path tracer material cache regression test" OFF)
+option(PT_QUALITY_PRESET_TESTS "Build the path tracer quality preset regression test" OFF)
+option(PT_CUDA_LIGHTING_TESTS "Build the CUDA path tracer lighting regression test" OFF)
+option(PT_CUDA_DENOISING_TESTS "Build the CUDA path tracer denoising regression test" OFF)
 
 if(NOT MSVC) # GCC/clang or compatible, hopefully
 	option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored compiler warnings/errors (GCC/Clang only; esp. useful with ninja)." OFF)
@@ -263,6 +268,14 @@ if(IMGUI)
 else()
 	message(STATUS "Dear ImGui integration disabled")
 	add_definitions(-DIMGUI_DISABLE)
+endif()
+
+if(PT_PHYSICAL)
+	if(NOT HAVE_CUDA OR NOT IMGUI)
+		message(FATAL_ERROR "PT_PHYSICAL requires CUDA_PATHTRACER=ON and IMGUI=ON with SDL2/SDL3")
+	endif()
+	add_definitions(-DPT_PHYSICAL)
+	message(STATUS "Experimental physical path tracing enabled")
 endif()
 
 if(DEFINED ENV{MSYSTEM})
@@ -656,6 +669,7 @@ set(src_renderer
 	renderer/tr_orderIndexes.cpp
 	renderer/tr_polytope.cpp
 	renderer/tr_render.cpp
+	renderer/tr_render_gl_stats.cpp
 	renderer/tr_rendertools.cpp
 	renderer/tr_shadowbounds.cpp
 	renderer/tr_stencilshadow.cpp
@@ -679,32 +693,35 @@ function(add_globbed_headers SRCLIST PATHPREFIX)
 endfunction()
 
 
-# Add CUDA path tracer source files if enabled
+# Path tracer (renderer_pt/): API-agnostic front end + scene builder, with one
+# subdirectory per compute backend. Each backend sets HAVE_<API> and contributes
+# host sources to src_renderer and device sources to src_renderer_pt_device.
+set(src_renderer_pt_device "")
 if(HAVE_CUDA)
-	add_definitions(-DHAVE_CUDA)
+	add_definitions(-DHAVE_PATHTRACER -DHAVE_CUDA)
 
 	list(APPEND src_renderer
-		renderer_cuda/cu_renderer.cpp
-		renderer_cuda/cu_renderer_frame.cpp
-		renderer_cuda/cu_renderer_geometry.cpp
-		renderer_cuda/cu_renderer_texture.cpp
-		renderer_cuda/cu_renderer_material.cpp
-		renderer_cuda/cu_renderer_light.cpp
-		renderer_cuda/cu_renderer_bvh.cpp
-		renderer_cuda/tr_backend_cuda.cpp
-		renderer_cuda/tr_render_cu_stats.cpp
-		renderer_cuda/tr_render_gl_stats.cpp
+		renderer_pt/pt_render.cpp
+		renderer_pt/pt_commands.cpp
+		renderer_pt/pt_scene.cpp
+		renderer_pt/pt_scene_material.cpp
+		renderer_pt/cuda/pt_backend_cuda.cpp
+	)
+	if(PT_PHYSICAL)
+		list(APPEND src_renderer renderer_pt/pt_physical.cpp)
+	endif()
+
+	list(APPEND src_renderer_pt_device
+		renderer_pt/cuda/pt_cuda_kernels.cu
+		renderer_pt/cuda/pt_cuda_lbvh.cu
 	)
 
-	# CUDA kernel file
-	set(src_renderer_cuda
-		renderer_cuda/cu_renderer_main.cu
-		renderer_cuda/cu_renderer_lbvh.cu
-	)
-
-	# Set CUDA compilation flags
 	set(CMAKE_CUDA_STANDARD 17)
-	set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+	if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+		set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+	endif()
+
+	add_globbed_headers(src_renderer "renderer_pt")
 endif()
 
 add_globbed_headers(src_renderer "renderer")
@@ -1312,6 +1329,43 @@ include_directories(${CMAKE_BINARY_DIR})
 include_directories(${CMAKE_SOURCE_DIR})
 
 add_library(idlib STATIC ${src_idlib})
+if(PT_MATERIAL_CACHE_TESTS)
+	enable_testing()
+	add_executable(pt_material_cache_test renderer_pt/tests/pt_material_cache_test.cpp)
+	target_link_libraries(pt_material_cache_test idlib)
+	add_test(pt_material_cache pt_material_cache_test)
+endif()
+if(PT_QUALITY_PRESET_TESTS)
+	enable_testing()
+	add_executable(pt_quality_preset_test renderer_pt/tests/pt_quality_preset_test.cpp)
+	target_link_libraries(pt_quality_preset_test idlib)
+	add_test(pt_quality_preset pt_quality_preset_test)
+endif()
+if(PT_CUDA_LIGHTING_TESTS)
+	if(NOT HAVE_CUDA)
+		message(FATAL_ERROR "PT_CUDA_LIGHTING_TESTS requires CUDA_PATHTRACER and a CUDA compiler")
+	endif()
+	enable_testing()
+	add_executable(pt_cuda_lighting_test renderer_pt/tests/pt_cuda_lighting_test.cu)
+	add_test(pt_cuda_lighting pt_cuda_lighting_test)
+	set_tests_properties(pt_cuda_lighting PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(PT_CUDA_DENOISING_TESTS)
+	if(NOT HAVE_CUDA)
+		message(FATAL_ERROR "PT_CUDA_DENOISING_TESTS requires CUDA_PATHTRACER and a CUDA compiler")
+	endif()
+	enable_testing()
+	add_executable(pt_cuda_denoising_test renderer_pt/tests/pt_cuda_denoising_test.cu
+		renderer_pt/cuda/pt_cuda_kernels.cu)
+	add_test(pt_cuda_denoising pt_cuda_denoising_test)
+	set_tests_properties(pt_cuda_denoising PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+if(PT_PHYSICAL)
+	enable_testing()
+	add_executable(pt_cuda_physical_test renderer_pt/tests/pt_cuda_physical_test.cu)
+	add_test(pt_cuda_physical pt_cuda_physical_test)
+	set_tests_properties(pt_cuda_physical PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 if(SDL3)
 	target_link_libraries(idlib SDL3::Headers) # so it can use SDL_Endian.h
 endif()
@@ -1350,7 +1404,7 @@ if(CORE)
 		${src_sys_core}
 		${src_imgui}
 		${src_editor_tools}
-		${src_renderer_cuda}
+		${src_renderer_pt_device}
 	)
 	
 	if(MSVC AND CMAKE_MAJOR_VERSION GREATER 3 OR ( CMAKE_MAJOR_VERSION EQUAL 3 AND CMAKE_MINOR_VERSION GREATER_EQUAL 6 ))

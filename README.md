@@ -1,91 +1,429 @@
-# DOOM3 CUDA PATH TRACING RENDERER
+# DOOM3 GPU PATH TRACING RENDERER
 
-This fork adds an experimental **GPU path tracing renderer** (`neo/renderer_cuda/`) built with
-NVIDIA CUDA that can replace the classic OpenGL rasterizer. It is gated behind the
+This fork adds an experimental **GPU path tracer** (`neo/renderer_pt/`) that can replace the
+classic OpenGL rasterizer for 3D views. The front end is compute-API agnostic; the only
+backend implemented today is **CUDA** (`neo/renderer_pt/cuda/`). It is gated behind the
 `CUDA_PATHTRACER` CMake option (off by default).
 
 ## Overview
 
-The renderer extracts the full scene (geometry, materials, lights) from dhewm3's existing
-draw-call pipeline each frame, uploads it to the GPU, builds a BVH, and path traces the
-image — blitting the final pixels back to OpenGL via `glDrawPixels`.
+Each frame the front end walks the view's draw surfaces and lights, builds a flat scene
+(vertices, triangles, materials, lights, textures) on the CPU and hands it to the active
+backend. The backend uploads it, builds a BVH on the GPU, path traces and tone maps the
+image, and the front end stretches the result over the view's viewport. 2D views and
+subviews (mirrors, remote cameras, portal skies) are still drawn with OpenGL, as is the HUD
+and all GUI drawing on top of the 3D view.
 
-## Rendering Modes
+## Source Layout
 
-| CVar Value | Mode |
-|------------|------|
-| 0 | **Full PBR path tracing** — Monte Carlo with Cook-Torrance BRDF, progressive accumulation |
-| 1 | BVH debug — ray cast with random per-triangle coloring |
-| 2–6 | Texture debug — visualise albedo, base color, normal map, specular map |
-| 7 | **Whitted-style ray tracing** — direct lighting, Blinn-Phong specular, mirror reflections |
+| Path | Contents |
+|------|----------|
+| `renderer_pt/pt_types.h` | POD types shared by host and device: `ptVertex_t`, `ptTriangle_t`, `ptMaterial_t`, `ptLight_t`, `ptBVHNode_t`, `ptRenderParams_t`, limits and enums |
+| `renderer_pt/pt_backend.h` | `idPathTracerBackend` – abstract compute backend interface and factory type |
+| `renderer_pt/pt_scene.h/.cpp`, `pt_scene_material.cpp` | `idPathTracerScene` – API-agnostic scene builder (geometry, Doom 3 material → PBR conversion, lights, texture readback, change hashes) |
+| `renderer_pt/pt_render.h/.cpp` | Front end: cvars, backend registry / lifecycle, accumulation control, viewport blit (`RB_PT_*`) |
+| `renderer_pt/pt_commands.cpp` | `r_ptCompare`, `r_ptSequence`, `r_ptAbort` capture tools |
+| `renderer_pt/cuda/` | CUDA backend (`idPathTracerBackendCUDA`), kernels and the GPU LBVH builder |
+
+## Adding a Backend (e.g. OpenCL)
+
+1. Implement `idPathTracerBackend` (see `pt_backend.h`) in `neo/renderer_pt/<api>/`.
+   The contract:
+   - `Init` / `Resize` allocate the output for the maximum (window) size. `Render` may be called with any smaller trace size.
+   - `UploadScene` receives an `idPathTracerScene`. Upload `PendingTextures()` into the slots given by their `index`. When `TextureGeneration()` changes, drop all cached textures.
+   - `Render` accumulates samples into a float buffer until `ResetAccumulation()` is called, then tone maps it to RGBA8. Only `PT_MODE_PATHTRACE` accumulates; debug modes overwrite.
+   - Report unrecoverable device errors through `IsHealthy()`, and the front end falls back to OpenGL.
+   - All data types in `pt_types.h` are plain structs with no API-specific members, so they can be copied to the device as-is.
+2. Export `PT_<API>_IsAvailable()` and `PT_<API>_CreateBackend()`, and add them to `ptBackendFactories[]` in `pt_render.cpp`.
+3. In `neo/CMakeLists.txt`, add a detection block that defines `HAVE_PATHTRACER` and `HAVE_<API>`. Append your host sources to `src_renderer` and any device sources to `src_renderer_pt_device`.
+4. Select it with `r_ptBackend <name>`. `auto` picks the first available backend.
+
+## Rendering Modes (`r_ptMode`)
+
+| Value | Mode |
+|-------|------|
+| 0 | **Path tracing** – Monte Carlo with Cook-Torrance BRDF, progressive accumulation |
+| 1 | BVH debug – primary rays with random per-triangle colours |
+| 2–6 | Texture debug – combined, base colour, albedo, normal map, specular map |
+| 7 | **Whitted-style ray tracing** – direct lighting, Blinn-Phong specular, mirror reflections |
 
 ## Key Features
 
-- **Linear BVH (LBVH)** built entirely on the GPU each frame using the Karras algorithm
-  and Thrust radix sort
-- **PBR materials** extracted from Doom 3 shader stages — albedo, normal map, specular,
-  alpha test, blend modes, vertex colors, emission, transmission/glass (Fresnel + IOR)
-- **Stochastic direct lighting** with soft shadows, projected textures, and spotlight falloff
-- **One-bounce indirect lighting** (global illumination) via cosine-weighted hemisphere sampling
-- **Volumetric scattering** with ray-marched Henyey-Greenstein phase function
-- **Progressive temporal accumulation** with automatic reset on camera movement and quality
-  ramp-up over successive frames
-- **Tone mapping** — selectable Reinhard / ACES / Uncharted 2 with configurable exposure and gamma
-- **Configurable render scale** (0.25×–1.0×) for performance tuning
-- **~50 CVars** controlling SPP, bounce depth, Russian roulette, firefly clamping, sky colour,
-  fog density, and more
-- **Comparison / sequence tools** for capturing side-by-side GL vs. path-traced screenshots
+- **Linear BVH (LBVH)** built entirely on the GPU every frame using the Karras algorithm
+  and a CUB radix sort, ordered on a single CUDA stream with no device-wide syncs
+- **PBR materials** extracted from Doom 3 shader stages: albedo, normal map, specular,
+  alpha test, blend modes, vertex colours, emission, glass (Fresnel + IOR). Time-varying shader
+  registers are re-evaluated every frame, per entity. Inactive material slots are reused,
+  and the cache grows when a view needs more simultaneously
+- **Stochastic direct lighting** with soft shadows: every enabled light stage, its projected
+  image and texture matrix, the engine-resolved falloff image, and `r_lightScale` contribute to
+  the lighting. Shadow rays pass through alpha tested and translucent surfaces
+- **sRGB correct shading**: textures and colours are decoded to linear before lighting
+- **First person weapon** rendered as an overlay that never gets clipped by nearby walls
+- **Indirect lighting** via cosine-weighted hemisphere sampling, plus textured emissive triangles
+  sampled as area lights with geometric falloff and visibility
+- **Volumetric scattering** with a ray-marched Henyey-Greenstein phase function
+- **Progressive accumulation** that resets on camera, mode, resolution or (configurable) scene
+  changes, uses a running mean to preserve precision, and ramps quality over the first frames
+- **Stackless BVH traversal** with escape links, so deep LBVH trees cannot overflow a per-ray stack
+- **Cache invalidation** after `reloadImages`, plus identity checks to avoid stale cache hits when
+  engine pointers are reused
+- **Tone mapping**: Reinhard / ACES / Uncharted 2 with exposure and gamma
+- **SVGF denoising**: illumination demodulation, camera reprojection, temporal luminance
+  moments, separate diffuse/specular filtering, and reflectance restoration before tone mapping
+- **Comparison / sequence tools** for side-by-side GL vs. path-traced screenshots
+
+### Denoising
+
+The CUDA denoiser implements a practical SVGF core inspired by
+[original Q2VKPT's approach](https://developer.nvidia.com/blog/path-tracing-quake-ii/),
+not a full port of Q2VKPT's adaptive A-SVGF pipeline:
+
+1. Trace fresh per-frame HDR samples alongside the untouched progressive mean. Keep
+   world position, unperturbed and shading normals, camera-forward depth, material identity,
+   roughness, and bounded diffuse/specular reflectance as guides, without additional guide rays. Average modulation color
+   across samples; bypass pixels whose samples disagree on the primary surface.
+2. Separate surface-scattered diffuse and specular transport at the primary BRDF,
+   including indirect bounces, without changing raw transport or random draws.
+   Demodulate each signal separately, reproject static-world history through the
+   previous camera, and reject incompatible depth, normals, materials, or reflectance.
+   Specular history additionally checks shading normals, roughness, and view direction.
+3. Accumulate luminance moments and bounded temporal history (up to 32 frames, with
+   a minimum new-color weight of 0.08). Bootstrap variance from the spatial neighborhood
+   for new/disoccluded pixels. Neighborhood clipping and lighting-change rejection
+   limit stale history, but are not the correlated temporal gradients of A-SVGF.
+   Specular history is shorter (4-24 frames depending on roughness), with a larger
+   minimum new-color weight for smooth highlights.
+4. Run four variance-guided atrous passes at pixel spacings 1, 2, 4, and 8. Retain the
+   first-pass illumination as feedback, then restore current reflectance for display.
+   Specular spacing is capped by roughness and its shading-normal guidance is stronger.
+   Add primary emission and volumetric scattering back as unfiltered residuals.
+
+Enabled by default in path tracing mode only. `r_ptDenoise 0` displays the raw progressive
+mean; `r_ptDenoiseStrength` adjusts the variance-guided luminance sigma. Denoising uses
+fresh samples, not the already averaged raw buffer, so it remains responsive while moving.
+`r_ptAccumulation` controls the raw progressive mean independently of SVGF history.
+Use `r_ptDenoise 0` and `r_ptDenoiseDebug 0` for progressively converged reference captures with `r_ptCompare`
+or `r_ptSequence`. These tools use an offline progressive path: full configured tracing
+quality from the first frame, running diffuse/specular means and variance of the mean,
+averaged surface guides, and spatial denoising of the accumulated signals. They do not
+use the real-time history caps or lighting-change clipping. Emission and volumetric
+residuals come from the full progressive mean too, so fresh fog noise cannot overwrite
+an otherwise converged capture. Each cinematic tick resets this accumulation; screenshot
+redraws reuse the completed result instead of adding extra samples.
+The camera, geometry, materials and lights are snapshotted for each captured tick, so
+render-time animation cannot perturb or repeatedly reset the progressive estimate.
+`r_ptDenoise 1` filters the progressive capture; `0` keeps it an unfiltered reference.
+Real-time volumetrics remain unfiltered and may still look noisy while playing.
+
+Camera movement resets the raw mean without automatically throwing away reprojectable
+history. Explicit resets, resolution/backend/texture changes, trace-setting changes,
+strict scene invalidations (`r_ptResetOnSceneChange 2`), and camera cuts invalidate denoiser history.
+The default scene policy (`1`) still resets the raw mean on structure-count changes,
+but preserves denoiser history subject to per-pixel validation. This prevents particles
+and visibility changes from repeatedly discarding valid static-world history. Changing
+exposure or gamma, or toggling denoising, does not alter the raw accumulation.
+
+This stage has no object motion vectors: non-world/deforming surfaces and view weapons
+receive spatial filtering only, never temporal reuse. Sky, transparent, ambient-only,
+no-shadow overlays, and mixed-primary-surface pixels bypass denoising. Opaque glossy,
+metallic, and emissive surfaces now participate; primary emission itself is not filtered.
+Adaptive gradient sampling, object motion vectors, transmission/volumetric denoising,
+and TAA remain future work; low-sample silhouettes can still shimmer, sharp reflections
+can remain noisy, and moving objects are spatial-only. Bypassed pixels display the raw
+progressive mean.
+
+Denoiser storage is allocated lazily at the trace resolution: 384 additional bytes per
+pixel (about 190 MiB at 960x540), rather than at full window resolution.
+
+#### Denoising diagnostics
+
+`r_ptDenoiseDebug` enables the denoiser even when `r_ptDenoise` is off. Return it to
+`0` for normal beauty/raw comparisons. Modes 1-4 bypass exposure, gamma, and tone mapping;
+modes 5-6 show only the filtered HDR signal through normal tone mapping.
+
+| Mode | Display |
+|---|---|
+| `1` | Coverage: green static, yellow dynamic/spatial-only, red transparent, magenta overlay/ambient, orange mixed, black miss |
+| `2` | History length: red = one frame, green = 32 frames; shorter specular caps will not reach full green |
+| `3` | Relative noise: compressed standard deviation divided by luminance; brighter means noisier |
+| `4` | History rejection reason (palette below) |
+| `5` | Filtered diffuse only, without emission/volume |
+| `6` | Filtered specular only, without emission/volume |
+
+`r_ptDenoiseDebugSignal 0` selects diffuse and `1` specular for modes 2-4.
+Rejection colors: green reused, magenta global reset, yellow dynamic/no motion,
+blue offscreen, red depth/disocclusion, cyan normal/view change, orange material,
+purple reflectance/roughness, white lighting change, gray missing samples, black unsupported.
+
+Generated area lights share a target budget of 512 lights with engine light stages. Engine
+light stages take priority and can grow beyond that budget; any emissive triangles that do
+not fit still contribute when hit by a bounce ray, and the renderer warns once when the budget
+is exceeded. Eligible opaque emitters are sampled on both sides,
+including their glow texture and alpha test. Transmissive emitters and no-shadow decal overlays
+are not sampled as area lights. The Whitted debug mode currently omits generated area lights.
 
 ## Building with CUDA
 
-Requires the NVIDIA CUDA Toolkit. Enable the option when running CMake:
+Requires the NVIDIA CUDA Toolkit and a host compiler it supports.
 
 ```
 cmake -DCUDA_PATHTRACER=ON /path/to/repository/neo
 ```
 
-The build targets SM 75 through SM 90 (Turing → Hopper). `.cu` files are compiled
-with NVCC; all other sources are compiled normally with the host C++ compiler.
+By default, kernels are built for SM 75–90 (Turing → Hopper). Override this with
+`-DCMAKE_CUDA_ARCHITECTURES=<list>`, for example `75` for a faster single-GPU build.
+
+If your distribution's GCC is newer than nvcc supports (for example, GCC 16 with CUDA 13.1),
+point nvcc at an older host compiler with `-DCMAKE_CUDA_HOST_COMPILER=g++-15`, or try:
+
+```
+CUDAFLAGS="-allow-unsupported-compiler -std=c++17" cmake -DCUDA_PATHTRACER=ON ...
+```
+
+Without `CUDA_PATHTRACER` the engine builds and runs as plain dhewm3, with no path tracer code compiled in.
+
+To run the material cache regression test, configure with `-DPT_MATERIAL_CACHE_TESTS=ON`,
+build the `pt_material_cache_test` target, then run `ctest -R pt_material_cache --output-on-failure`
+from the build directory. This test does not require CUDA.
+
+For the quality preset regression test, configure with `-DPT_QUALITY_PRESET_TESTS=ON`,
+build `pt_quality_preset_test`, and run `ctest -R pt_quality_preset --output-on-failure`.
+This test also works without CUDA.
+
+For the GPU lighting regression test, also configure with `-DPT_CUDA_LIGHTING_TESTS=ON`,
+build `pt_cuda_lighting_test`, and run `ctest -R pt_cuda_lighting --output-on-failure`.
+It requires the CUDA toolkit and skips at runtime if no CUDA device or driver is available.
+
+For the GPU denoising regression test, configure with `-DPT_CUDA_DENOISING_TESTS=ON`,
+build `pt_cuda_denoising_test`, and run `ctest -R pt_cuda_denoising --output-on-failure`.
+It checks diffuse/specular noise reduction, temporal reuse and roughness-dependent bounded history, camera reprojection,
+disocclusion/lighting-change rejection, texture restoration, edge preservation, small/odd
+image sizes, diagnostic palettes, signal-only output, and tone-mapped output. It skips if no CUDA device or driver is available.
+The lighting regression test also checks guide eligibility, multi-sample guide generation,
+fresh radiance independent of the progressive mean, unchanged raw accumulation, and
+diffuse/specular conservation for direct, indirect, emissive, clamped, and volumetric cases.
+
+### Decal blending
+
+Material overlays support ordinary and inverse-color multiplication in both
+path tracing and Whitted modes. Doom 3 blood decals use
+`blend gl_zero, gl_one_minus_src_color`: their cyan-on-black source image is a
+filter, not emitted color or an alpha-over layer. The renderer complements the
+gamma-encoded source before converting the filter to linear throughput, preserving
+the floor behind black texels and producing the intended red stain. Texture alpha
+does not control this blend; stage RGB and vertex-color modulation still apply.
+The same filter is applied to the single-bounce indirect estimator. Such overlays
+retain the raw progressive fallback rather than borrowing an opaque surface's
+denoising history.
+
+### Experimental physical rendering (`PT_PHYSICAL`)
+
+This is a separate, **default-OFF build-time rendering model**, not another
+quality preset. Build it with CUDA and the existing Dear ImGui integration:
+
+```sh
+cmake -S neo -B build-physical -DCUDA_PATHTRACER=ON -DIMGUI=ON -DPT_PHYSICAL=ON
+cmake --build build-physical -j2
+```
+
+The CUDA host-compiler compatibility notes above also apply to this build.
+Run the new executable in `build-physical/`, not an older executable in `neo/`.
+Game data and game libraries must be installed as for a normal engine build.
+Omitting `PT_PHYSICAL`, or setting it to `OFF`, retains the existing Doom 3-style
+path tracing. OpenGL is unchanged. In a physical build, path tracing mode
+(`r_ptDraw 1`, `r_ptMode 0`) always uses the experimental model; other diagnostic
+and Whitted modes retain their existing shading.
+
+The model provides:
+
+- Inverse-square point lighting in meters, lumen-based light stages, lux-based
+  directional lights, and normalized spotlight angular profiles. Legacy box/radius
+  attenuation and falloff textures no longer bound these lights. Spotlight gobos
+  remain angular filters and can reduce the transmitted flux.
+- All registered engine lights, with animated shader stages and view suppression,
+  rather than only lights passing Doom 3's light-volume visibility tests.
+- Reciprocal GGX specular with height-correlated Smith visibility, dielectric IOR,
+  Fresnel-attenuated diffuse, bounded reflectance, and diffuse/GGX mixture sampling
+  for indirect paths. Legacy specular brightness no longer invents metalness.
+- Emissive surface luminance in cd/m^2 (nits), shared consistently by visible
+  emission and sampled emissive triangles.
+- A photographic camera: `EV100 = log2(N^2 / t * 100 / ISO)` and
+  `exposure = 2^compensation / (1.2 * 2^EV100)`. The camera uses millimeter focal
+  length and sensor width, meter focus distance, and a uniformly sampled circular
+  thin lens. Sensor height follows the actual viewport aspect ratio. Lens FOV is
+  applied before engine culling, not only to traced rays.
+
+Run `r_ptPhysicalUI` in the console to toggle the ImGui tuning panel. For example,
+`bind F9 r_ptPhysicalUI` makes it accessible while playing. Existing ImGui mouse,
+keyboard, focus, and close-button handling apply. Controls persist as archived
+CVars and the panel locks its tuning controls during a capture; close it before
+recording a clean screenshot or sequence.
+
+| CVar | Default | Physical interpretation |
+|---|---|---|
+| `r_ptPhysicalMetersPerUnit` | `0.0254` | Meters per engine unit; assumes inches |
+| `r_ptPhysicalLightLumens` | `1500` | Flux represented by a unit-white engine light stage |
+| `r_ptPhysicalSunLux` | `50000` | Illuminance represented by a unit-white directional light |
+| `r_ptPhysicalEmissionNits` | `100` | Luminance represented by unit-white material emission |
+| `r_ptPhysicalIor` | `1.5` | Opaque dielectric IOR, giving F0 = 0.04 at the default |
+| `r_ptPhysicalRoughnessScale` | `1` | Scale for approximate legacy-map roughness |
+| `r_ptPhysicalISO` | `800` | Camera sensitivity |
+| `r_ptPhysicalShutter` | `0.03333333` | Exposure time in seconds (1/30 s) |
+| `r_ptPhysicalFNumber` | `2.8` | Aperture for both exposure and lens blur |
+| `r_ptPhysicalExposureCompensation` | `0` | Exposure compensation in stops |
+| `r_ptPhysicalFocalLength` | `35` | Focal length in mm |
+| `r_ptPhysicalSensorWidth` | `36` | Sensor width in mm |
+| `r_ptPhysicalFocusDistance` | `3` | Forward focus-plane distance in meters |
+| `r_ptPhysicalDOF` | `1` | Thin-lens blur; `0` selects a pinhole without changing exposure |
+
+Exposure/ISO/shutter changes preserve the scene-linear accumulated estimate.
+Focus, lens/aperture, material calibration, world scale, and lighting changes
+invalidate affected accumulation/history. DOF disables real-time temporal history:
+a pinhole reprojection cannot correctly reuse a stochastic lens sample. Spatial
+denoising remains available, and cinematic captures still accumulate and denoise
+all configured samples with the existing offline progressive path.
+
+This is **not a conversion to measured PBR assets**: the source materials and
+light stages have no calibrated units. Their RGB values and specular maps remain
+approximations; the calibration controls set their assumed physical scale.
+Placed point lights are ideal point sources (hard shadows); actual emissive
+triangles provide area-light soft shadows. Existing transparent/additive overlays,
+straight-through glass, geometry visibility/portal extraction, output gamma and
+tone mappers remain approximations inherited from the renderer. Surfaces outside
+the engine's extracted scene cannot reflect or occlude light. The physical lens
+overrides gameplay FOV, so this mode is especially suited to cinematic work.
+Shutter time does not provide motion blur. Participating media are not yet modeled:
+legacy volumetrics are disabled, as are artistic light/specular/emission boosts,
+the legacy single-bounce GI shortcut and biased radiance/firefly clamps.
+`r_ptSkyIntensity`, if enabled, is interpreted as environment luminance and
+illuminates secondary misses too; it is no longer only a backdrop.
+
+Physical builds include `pt_cuda_physical_test`; run
+`ctest --test-dir build-physical -R pt_cuda_physical --output-on-failure`.
+It checks exposure stops, lens units/FOV/focus and aperture distribution,
+inverse-square lighting and selection beyond old light volumes, unclamped direct
+light, spotlight normalization, BRDF reciprocity, and Monte Carlo energy bounds
+for diffuse/metallic materials from polished to rough and normal to grazing views.
+
+## Console Commands
+
+| Command | Description |
+|---------|-------------|
+| `r_ptInfo` | List compiled backends and print device / memory / timing info for the active one |
+| `r_ptReset` | Restart accumulation and drop cached materials and textures |
+| `r_ptCompare [frames]` | Save an OpenGL and a path-traced screenshot after the given accumulated frame count |
+| `r_ptSequence <start> <end> [frames]` | Path trace a range of demo frames to screenshots |
+| `r_ptAbort` | Abort `r_ptCompare` / `r_ptSequence` |
+| `r_glSequence` / `r_glAbort` | OpenGL counterpart of `r_ptSequence` (always available) |
+
+To capture Enpro from startup, append `+map game/enpro +r_ptSequence 200 1460 128`
+to the engine command line. The sequence waits for the main 3D view, advances 200
+game ticks from the loaded state using OpenGL, then freezes each tick while tracing.
+Loading screens, GUI/subviews, and screenshot redraws do not advance the PT sequence.
+Frames are relative to the state where capture starts; the command does not reload or
+rewind an already running map. Images are written to `screenshots/ptseq_00200.*` through
+`ptseq_01460.*` under the game's save path. `r_ptAbort` cancels and restores capture settings.
+
+The comparison and sequence targets count accumulated frames, not individual samples per pixel;
+the `_spp` suffix in screenshot filenames is historical.
+
+## Path Tracing Quality Presets
+
+Set `r_ptPreset low`, `med`, `high`, or `ultra` in the console. Presets update the following
+quality variables immediately; Medium matches the original defaults:
+
+| Preset | `r_ptRenderScale` | `r_ptSamplesPerPixel` | `r_ptMaxDepth` | `r_ptMaxLightSamples` |
+|--------|-------------------|-----------------------|----------------|-----------------------|
+| `low` | 0.35 | 1 | 2 | 1 |
+| `med` | 0.5 | 4 | 3 | 2 |
+| `high` | 0.75 | 6 | 4 | 3 |
+| `ultra` | 1.0 | 8 | 5 | 4 |
+
+Changing one of these variables manually switches `r_ptPreset` to `custom` and keeps the
+edited values. Selecting `custom` directly also leaves the current settings unchanged, and
+existing custom settings are preserved when upgrading. Presets do not change exposure, lighting
+colour, or other artistic controls. High and Ultra can be substantially slower; the progressive
+quality ramp still reduces samples and bounces for the first few frames after movement or a
+reset. With `r_ptAccumulation 0`, every frame uses the first-frame limits.
+
+### Enpro lighting/look profile
+
+For a clearer, brighter path-traced `game/enpro`, load the opt-in profile shipped
+in [`neo/base/pt_enpro.cfg`](neo/base/pt_enpro.cfg):
+
+```
+exec pt_enpro.cfg
+map game/enpro
+```
+
+The config must be in the game's `base` search path; copy it there if your Doom 3
+data lives outside `neo/base`. It does not load a map or teleport the player itself.
+The reference viewpoint is:
+
+```
+setviewpos -1177.94 3760.25 -155.75 131.5
+```
+
+This uses High quality and SVGF, raises exposure to 2.2 and emissive lighting to 2,
+nudges `r_lightScale` from 2 to 2.2, and reduces specular boost to 1 to balance hot
+highlights. It keeps ACES and gamma 2.2, uses gentler low-throughput roulette for
+cleaner indirect estimates, and disables volumetric density to remove the noisy
+haze. The sky is deliberately unchanged: `r_ptSkyIntensity` only affects primary
+misses and does not light the room.
+
+The look is opt-in and does not change renderer defaults or map assets. `seta`
+values persist in your saved configuration; `r_lightScale` is session-only and
+also affects OpenGL, so restore it to 2 when comparing against stock lighting.
+For more speed, select `r_ptPreset med` after executing the config; the artistic
+settings remain. This is a lighting balance, not a relit map: fully unlit areas
+still need actual lights or emissive geometry to receive illumination.
 
 ## Console Variables
 
-All CVars use the `r_cu` prefix and can be set from the Doom 3 console or config files.
-
 | CVar | Default | Description |
 |------|---------|-------------|
-| `r_cuRenderer` | `1` | Enable the CUDA renderer |
-| `r_cuRendererMode` | `0` | Render mode: 0 = path tracing, 1 = BVH debug, 2 = textured combined, 3 = base color, 4 = albedo texture, 5 = normal texture, 6 = specular texture, 7 = Whitted ray tracing |
-| `r_cuDebug` | `0` | Show CUDA renderer debug info |
-| `r_cuRenderScale` | `0.5` | Render resolution scale (0.25–1.0, lower = faster) |
-| `r_cuSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
-| `r_cuMaxBounces` | `3` | Maximum ray bounces (1–16) |
-| `r_cuDirectSamples` | `2` | Direct light samples per hit (1–8) |
-| `r_cuIndirectProbability` | `0.15` | Indirect lighting probability (0.0–1.0) |
-| `r_cuRussianRoulette` | `1` | Enable Russian roulette path termination |
-| `r_cuRRMinBounces` | `2` | Minimum bounces before Russian roulette kicks in (1–8) |
-| `r_cuRRMinSurvival` | `0.1` | Minimum survival probability (0.05–0.5) |
-| `r_cuRRThreshold` | `0.05` | Throughput threshold for early termination (0.0–0.5) |
-| `r_cuFireflyClamp` | `5.0` | Clamp max sample brightness (0 = off) |
-| `r_cuEarlyTermination` | `0.25` | Early path termination on low throughput (0.0–1.0) |
-| `r_cuAccumulation` | `1` | Temporal accumulation (0 = off, 1 = on) |
-| `r_cuRayOffset` | `0.001` | Ray origin offset to prevent self-intersection |
-| `r_cuEmissionScale` | `1.0` | Emission multiplier (0.1–10.0) |
-| `r_cuSpecularScale` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
-| `r_cuSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard, 0.05 = subtle, 0.2 = soft) |
-| `r_cuExposure` | `1.0` | Exposure multiplier (0.1–10.0) |
-| `r_cuGamma` | `2.2` | Gamma correction (1.8–2.6) |
-| `r_cuToneMap` | `1` | Tone mapper: 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |
-| `r_cuSkyIntensity` | `0.0` | Sky dome ambient intensity (0.0–2.0) |
-| `r_cuSkyZenithR/G/B` | `0.3 / 0.35 / 0.5` | Sky zenith colour |
-| `r_cuSkyHorizonR/G/B` | `0.4 / 0.35 / 0.3` | Sky horizon colour |
-| `r_cuSkyGroundR/G/B` | `0.1 / 0.08 / 0.05` | Sky ground colour |
-| `r_cuVolumetricIntensity` | `0.0` | Volumetric scattering intensity (0 = off, expensive) |
-| `r_cuVolumetricDensity` | `0.008` | Fog density (0.001–0.1) |
-| `r_cuVolumetricSteps` | `16` | Ray-march steps (4–64) |
-| `r_cuVolumetricAnisotropy` | `0.6` | Scattering anisotropy, Henyey-Greenstein g (−1 to 1) |
-| `r_cuVolumetricFalloff` | `2.0` | Distance falloff exponent |
-| `r_cuVolumetricMaxDist` | `500.0` | Maximum sampling distance |
+| `r_ptDraw` | `1` | Draw 3D views with the path tracer (0 = OpenGL) |
+| `r_ptBackend` | `auto` | Compute backend: `auto`, `cuda` |
+| `r_ptMode` | `0` | Render mode, see above |
+| `r_ptDebug` | `0` | Print per-frame scene / timing info |
+| `r_ptPreset` | `med` | Apply a quality preset: `low`, `med`, `high`, `ultra`, or `custom` |
+| `r_ptRenderScale` | `0.5` | Trace resolution relative to the viewport (0.1–1.0) |
+| `r_ptSamplesPerPixel` | `4` | Samples per pixel per frame (1–64) |
+| `r_ptMaxDepth` | `3` | Maximum ray bounces (1–16) |
+| `r_ptMaxLightSamples` | `2` | Lights sampled per hit, picked by estimated contribution (1–8) |
+| `r_ptIndirectProb` | `0.15` | Probability of the one bounce GI estimate, only used when `r_ptMaxDepth` is 1 (0–1) |
+| `r_ptRussianRoulette` | `1` | Russian roulette path termination |
+| `r_ptRRMinBounces` | `2` | Bounces before Russian roulette starts (0–16) |
+| `r_ptRRSurvivalMin` | `0.1` | Minimum survival probability (0.01–0.95) |
+| `r_ptEarlyTermThreshold` | `0.05` | Russian roulette for paths below this throughput after a bounce (0–0.5, unbiased) |
+| `r_ptThroughputClamp` | `0.25` | Russian roulette for paths below this throughput after shading (0–1, unbiased) |
+| `r_ptFireflyClamp` | `5.0` | Clamp per-sample radiance (0 = off) |
+| `r_ptAccumulation` | `1` | Accumulate samples while the view is static |
+| `r_ptResetOnSceneChange` | `1` | Scene resets: 0 = none, 1 = raw mean on structure changes with per-pixel denoiser validation, 2 = raw mean and denoiser on any content change |
+| `r_ptRayOffset` | `0.001` | Ray origin offset against self-intersection |
+| `r_ptEmissionBoost` | `1.0` | Emission multiplier |
+| `r_ptSpecularBoost` | `2.0` | Specular BRDF multiplier (Doom 3 uses 2×) |
+| `r_ptSoftShadowScale` | `0.2` | Soft shadow jitter (0 = hard shadows) |
+| `r_ptDenoise` | `1` | SVGF temporal/variance-guided denoising in path tracing mode only |
+| `r_ptDenoiseStrength` | `0.5` | Variance-guided luminance sigma scale (0.05–4); higher values smooth more |
+| `r_ptDenoiseDebug` | `0` | 0 beauty, 1 coverage, 2 history, 3 relative noise, 4 rejection, 5 diffuse, 6 specular |
+| `r_ptDenoiseDebugSignal` | `0` | Signal for diagnostics 2-4: 0 diffuse, 1 specular |
+| `r_ptExposure` | `1.0` | Exposure multiplier |
+| `r_ptGamma` | `2.2` | Output gamma, textures and colors are decoded with 2.2 |
+| `r_ptToneMapMode` | `1` | 0 = Reinhard, 1 = ACES, 2 = Uncharted 2 |
+| `r_ptSkyIntensity` | `0.0` | Sky dome intensity for primary ray misses |
+| `r_ptSkyColorZenithR/G/B` | `0.3 / 0.35 / 0.5` | Sky zenith colour |
+| `r_ptSkyColorHorizonR/G/B` | `0.4 / 0.35 / 0.3` | Sky horizon colour |
+| `r_ptSkyColorGroundR/G/B` | `0.1 / 0.08 / 0.05` | Sky ground colour |
+| `r_ptVolumetric` | `0.0` | Volumetric scattering intensity (0 = off, expensive) |
+| `r_ptVolumetricDensity` | `0.008` | Fog density |
+| `r_ptVolumetricSteps` | `16` | Ray-march steps (1–128) |
+| `r_ptVolumetricAnisotropy` | `0.6` | Henyey-Greenstein g (−1 to 1) |
+| `r_ptVolFalloff` | `2.0` | Distance falloff exponent |
+| `r_ptVolMaxDist` | `500.0` | Maximum sampling distance |
 
+The old `r_cu*` cvars have been renamed to `r_pt*`. Old config entries are ignored.
 
 # ABOUT
 

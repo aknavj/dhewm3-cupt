@@ -3,8 +3,46 @@
 
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_physical.cuh"
+
+__device__ inline bool PT_IsModulation(int blendMode) {
+	return blendMode == PT_BLEND_MODULATE || blendMode == PT_BLEND_MODULATE_INVERSE;
+}
+
+__device__ inline float PT_ModulationFactor(float linearSource, int blendMode) {
+	if (blendMode != PT_BLEND_MODULATE_INVERSE) return linearSource;
+	// Legacy framebuffer blending complements the gamma-encoded source, not linear radiance.
+	const float source = powf(fmaxf(linearSource, 0.0f), 1.0f / 2.2f);
+	return PT_SrgbToLinear(fmaxf(0.0f, 1.0f - source));
+}
+
+__device__ __forceinline__ void PT_ApplyTexTransform(const ptMaterial_t& material, float& tu, float& tv) {
+	const float* xf = material.texTransform;
+	if (xf[0] == 1.0f && xf[1] == 0.0f && xf[2] == 0.0f
+		&& xf[3] == 0.0f && xf[4] == 1.0f && xf[5] == 0.0f) {
+		return;
+	}
+	const float u = xf[0] * tu + xf[1] * tv + xf[2];
+	const float v = xf[3] * tu + xf[4] * tv + xf[5];
+	tu = u - floorf(u);
+	tv = v - floorf(v);
+}
+
+__device__ __forceinline__ void PT_ApplyVertexColor(
+	const ptMaterial_t& material, const ptVertex_t* vertices, const ptTriangle_t& tri,
+	float w, float u, float v, float* color
+) {
+	if (!material.useVertexColor) return;
+	const ptVertex_t& v0 = vertices[tri.vertexIndices[0]];
+	const ptVertex_t& v1 = vertices[tri.vertexIndices[1]];
+	const ptVertex_t& v2 = vertices[tri.vertexIndices[2]];
+	for (int c = 0; c < 4; c++) {
+		const float vertexColor = w * v0.color[c] + u * v1.color[c] + v * v2.color[c];
+		color[c] *= c < 3 ? PT_SrgbToLinear(vertexColor) : vertexColor;
+	}
+}
 
 /*
 =================================================================================
@@ -24,12 +62,13 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 	u = u - floorf(u);
 	v = v - floorf(v);
 
-	// convert to texel coordinates
-	float x = u * (float)tex.width;
-	float y = v * (float)tex.height;
-
-	int x0 = (int)x % tex.width;
-	int y0 = (int)y % tex.height;
+	// Normalized GL sampling places texel centers at (i + 0.5) / size.
+	float x = u * (float)tex.width - 0.5f;
+	float y = v * (float)tex.height - 0.5f;
+	const int ix = (int)floorf(x);
+	const int iy = (int)floorf(y);
+	int x0 = (ix % tex.width + tex.width) % tex.width;
+	int y0 = (iy % tex.height + tex.height) % tex.height;
 	int x1 = (x0 + 1) % tex.width;
 	int y1 = (y0 + 1) % tex.height;
 
@@ -47,6 +86,57 @@ __device__ inline void SampleTexture(const cudaTexture_t* textures, int texIndex
 		float v1 = tex.data[idx01 + c] * (1.0f - fx) + tex.data[idx11 + c] * fx;
 		color[c] = (v0 * (1.0f - fy) + v1 * fy) / 255.0f;
 	}
+}
+
+// SampleTexture with the color channels decoded from sRGB (albedo, glow and light images)
+__device__ inline void SampleTextureSrgb(const cudaTexture_t* textures, int texIndex, float u, float v, float* color) {
+	SampleTexture(textures, texIndex, u, v, color);
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
+}
+
+__device__ inline void SampleLightTextureSrgb(const cudaTexture_t* textures, int texIndex,
+	float u, float v, int address, float* color) {
+	if (texIndex < 0 || texIndex >= MAX_TEXTURES || !textures[texIndex].data
+		|| textures[texIndex].width <= 0 || textures[texIndex].height <= 0) {
+		color[0] = color[1] = color[2] = color[3] = 1.0f;
+		return;
+	}
+
+	const cudaTexture_t& tex = textures[texIndex];
+	if (address == PT_LIGHT_TEXTURE_CLAMP) {
+		const float halfU = 0.5f / (float)tex.width;
+		const float halfV = 0.5f / (float)tex.height;
+		u = fminf(fmaxf(u, halfU), 1.0f - halfU);
+		v = fminf(fmaxf(v, halfV), 1.0f - halfV);
+		SampleTexture(textures, texIndex, u, v, color);
+	} else if (address == PT_LIGHT_TEXTURE_BORDER) {
+		const float x = u * (float)tex.width - 0.5f;
+		const float y = v * (float)tex.height - 0.5f;
+		color[0] = color[1] = color[2] = color[3] = 0.0f;
+		if (x > -1.0f && x < (float)tex.width && y > -1.0f && y < (float)tex.height) {
+			const int x0 = (int)floorf(x);
+			const int y0 = (int)floorf(y);
+			const float fx = x - (float)x0;
+			const float fy = y - (float)y0;
+			for (int dy = 0; dy < 2; dy++) {
+				for (int dx = 0; dx < 2; dx++) {
+					const int ix = x0 + dx;
+					const int iy = y0 + dy;
+					if (ix < 0 || ix >= tex.width || iy < 0 || iy >= tex.height) continue;
+					const float weight = (dx ? fx : 1.0f - fx) * (dy ? fy : 1.0f - fy) / 255.0f;
+					const int index = (iy * tex.width + ix) * 4;
+					for (int c = 0; c < 4; c++) color[c] += tex.data[index + c] * weight;
+				}
+			}
+		}
+	} else {
+		SampleTexture(textures, texIndex, u, v, color);
+	}
+	color[0] = PT_SrgbToLinear(color[0]);
+	color[1] = PT_SrgbToLinear(color[1]);
+	color[2] = PT_SrgbToLinear(color[2]);
 }
 
 /*
@@ -78,7 +168,7 @@ __device__ inline float DistributionGGX(float NdotH, float roughness) {
 	float NdotH2 = NdotH * NdotH;
 
 	float denom = NdotH2 * (a2 - 1.0f) + 1.0f;
-	denom = M_PI * denom * denom;
+	denom = PT_PI * denom * denom;
 
 	return a2 / fmaxf(denom, 0.0001f);
 }
@@ -106,7 +196,7 @@ __device__ void EvaluateMaterial(
 	float* brdf
 ) {
 	float ndotwi = fmaxf(0.0f, dot3(normal, wi));
-	float diffuse = ndotwi / M_PI;
+	float diffuse = ndotwi / PT_PI;
 
 	brdf[0] = albedo[0] * diffuse;
 	brdf[1] = albedo[1] * diffuse;
@@ -123,13 +213,22 @@ __device__ void EvaluatePBRMaterial(
 	float roughness,
 	float specularBoost,  // Doom 3 interaction shader doubles specular
 	const float* specColor,  // specular tint from specular map
-	float* brdf
+	float* brdf,
+	float* diffuseBrdf = NULL,
+	const ptRenderParams_t* params = NULL
 ) {
+#ifdef PT_PHYSICAL
+	if (PT_PhysicalActive(params)) {
+		PT_EvaluatePhysicalMaterial(albedo, normal, wo, wi, metallic, roughness, params->physicalIor, brdf, diffuseBrdf);
+		return;
+	}
+#endif
 	float NdotL = fmaxf(0.0f, dot3(normal, wi));
 	float NdotV = fmaxf(0.0f, dot3(normal, wo));
 
 	if (NdotL <= 0.0f || NdotV <= 0.0f) {
 		brdf[0] = brdf[1] = brdf[2] = 0.0f;
+		if (diffuseBrdf) diffuseBrdf[0] = diffuseBrdf[1] = diffuseBrdf[2] = 0.0f;
 		return;
 	}
 
@@ -174,14 +273,17 @@ __device__ void EvaluatePBRMaterial(
 
 	// Lambertian diffuse: albedo / pi
 	float diff[3];
-	diff[0] = kD[0] * albedo[0] / M_PI;
-	diff[1] = kD[1] * albedo[1] / M_PI;
-	diff[2] = kD[2] * albedo[2] / M_PI;
+	diff[0] = kD[0] * albedo[0] / PT_PI;
+	diff[1] = kD[1] * albedo[1] / PT_PI;
+	diff[2] = kD[2] * albedo[2] / PT_PI;
 
 	// return pure BRDF f(wo,wi) = diffuse + specular (NO NdotL here)
 	brdf[0] = diff[0] + specular[0];
 	brdf[1] = diff[1] + specular[1];
 	brdf[2] = diff[2] + specular[2];
+	if (diffuseBrdf) {
+		for (int c = 0; c < 3; c++) diffuseBrdf[c] = diff[c];
+	}
 }
 
 #endif // __CU_RENDERER_MATERIAL_CUH__

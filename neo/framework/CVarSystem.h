@@ -202,6 +202,11 @@ ID_INLINE idCVar::idCVar( const char *name, const char *value, int flags, const 
 	Init( name, value, flags, description, 1, -1, valueStrings, valueCompletion );
 }
 
+typedef void ( *cvarChangeCallback_t )( const idCVar &cvar );
+
+// Callbacks must remain valid until the CVar system shuts down.
+bool CVar_RegisterChangeCallback( const idCVar &cvar, cvarChangeCallback_t callback );
+
 
 /*
 ===============================================================================

@@ -3,10 +3,9 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <device_launch_parameters.h>
-#include <curand_kernel.h>
 
-#include "renderer_cuda/cu_renderer.h"
-#include "renderer_cuda/cu_renderer_math.cuh"
+#include "renderer_pt/cuda/pt_cuda_device.h"
+#include "renderer_pt/cuda/pt_cuda_math.cuh"
 
 /*
 ========================
@@ -47,8 +46,8 @@ Möller-Trumbore intersection, returns t (or -1 on miss)
 __device__ __forceinline__ float IntersectTriangle_Simple(
 	float origX, float origY, float origZ,
 	float dirX, float dirY, float dirZ,
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t& tri
+	const ptVertex_t* vertices,
+	const ptTriangle_t& tri
 ) {
 	const float* v0 = vertices[tri.vertexIndices[0]].position;
 	const float* v1 = vertices[tri.vertexIndices[1]].position;
@@ -84,48 +83,19 @@ TriangleDrawKernel
 Simple BVH debug visualization — random color per triangle.
 ========================
 */
-__global__ __forceinline__ void TriangleDrawKernel(
-	const cudaVertex_t* vertices,
-	const cudaTriangle_t* triangles,
-	const cudaBVHNode_t* bvhNodes,
+__global__ void TriangleDrawKernel(
+	const ptVertex_t* vertices,
+	const ptTriangle_t* triangles,
+	const ptBVHNode_t* bvhNodes,
 	const int* triIndices,
-	const cudaMaterial_t* materials,
+	const ptMaterial_t* materials,
 	const cudaTexture_t* textures,
-	const cudaLight_t* lights,
+	const ptLight_t* lights,
 	int numLights,
 	float* framebuffer,
-	int width,
-	int height,
-	const float* cameraPos,
-	const float* cameraForward,
-	const float* cameraRight,
-	const float* cameraUp,
-	float fov,
-	float fovY,
-	int samplesPerPixel,
-	int maxDepth,
-	int maxLightSamples,
-	int frameIndex,
-	float emissionBoost,
-	float indirectProb,
-	int rrEnabled,
-	int rrMinBounces,
-	float rrSurvivalMin,
-	float earlyTermThreshold,
-	float fireflyClamp,
-	float throughputClamp,
-	float rayOffset,
-	float specularBoost,
-	float skyIntensity,
-	const float* skyColorZenith,
-	const float* skyColorHorizon,
-	const float* skyColorGround,
-	float volumetricDensity,
-	int volumetricSteps,
-	float volumetricAnisotropy,
-	float volFalloff,
-	float volMaxDist
+	const ptRenderParams_t params
 ) {
+	PT_UNPACK_RENDER_PARAMS(params);
 	int x = blockIdx.x * blockDim.x + threadIdx.x;
 	int y = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -163,16 +133,12 @@ __global__ __forceinline__ void TriangleDrawKernel(
 	float nearestT = 1e30f;
 	int hitTriIdx = -1;
 
-	int stack[64];
-	int stackPtr = 0;
-	stack[stackPtr++] = 0;
-
-	while (stackPtr > 0) {
-		int nodeIdx = stack[--stackPtr];
-		const cudaBVHNode_t& node = bvhNodes[nodeIdx];
+	for (int nodeIdx = 0; nodeIdx >= 0; ) {
+		const ptBVHNode_t& node = bvhNodes[nodeIdx];
 
 		if (!IntersectAABB_Simple(origX, origY, origZ, invDirX, invDirY, invDirZ,
 								  node.bounds, nearestT)) {
+			nodeIdx = node.escapeIndex;
 			continue;
 		}
 
@@ -188,13 +154,9 @@ __global__ __forceinline__ void TriangleDrawKernel(
 					hitTriIdx = triIdx;
 				}
 			}
+			nodeIdx = node.escapeIndex;
 		} else {
-			if (node.leftChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.leftChild;
-			}
-			if (node.rightChild >= 0 && stackPtr < 63) {
-				stack[stackPtr++] = node.rightChild;
-			}
+			nodeIdx = node.leftChild;
 		}
 	}
 

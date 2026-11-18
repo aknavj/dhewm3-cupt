@@ -14,7 +14,10 @@ enum D3ImGuiWindow {
 	D3_ImGuiWin_None        = 0,
 	D3_ImGuiWin_Settings    = 1, // advanced dhewm3 settings menu
 	D3_ImGuiWin_Demo        = 2, // ImGui demo window
-	// next should be 4, then 8, etc so a bitmask can be used
+#ifdef PT_PHYSICAL
+	D3_ImGuiWin_PhysicalPT  = 4,
+#endif
+	// Use successive powers of two so a bitmask can be used.
 };
 
 #ifndef IMGUI_DISABLE

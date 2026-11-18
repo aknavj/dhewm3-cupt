@@ -1,9 +1,8 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <thrust/sort.h>
-#include <thrust/device_ptr.h>
+#include <cub/device/device_radix_sort.cuh>
 
-#include "renderer_cuda/cu_renderer.h"
+#include "renderer_pt/cuda/pt_cuda_device.h"
 
 /*
 ================================================================================
@@ -35,7 +34,7 @@ Kernel 1: Compute Morton Codes
 */
 
 __global__ void ComputeMortonCodesKernel(
-	const cudaTriangle_t* triangles,
+	const ptTriangle_t* triangles,
 	int numTriangles,
 	unsigned int* mortonCodes,
 	int* indices,
@@ -45,7 +44,7 @@ __global__ void ComputeMortonCodesKernel(
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= numTriangles) return;
 
-	const cudaTriangle_t& tri = triangles[idx];
+	const ptTriangle_t& tri = triangles[idx];
 
 	// Centroid from precomputed bounds
 	float cx = (tri.bounds[0] + tri.bounds[3]) * 0.5f;
@@ -92,7 +91,7 @@ Kernel 2: Build Radix Tree
 __global__ void BuildRadixTreeKernel(
 	const unsigned int* sortedMortonCodes,
 	int numPrimitives,
-	cudaBVHNode_t* nodes,
+	ptBVHNode_t* nodes,
 	int* parents
 ) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -175,9 +174,9 @@ Kernel 3: Initialize Leaf Nodes
 */
 
 __global__ void InitLeafNodesKernel(
-	const cudaTriangle_t* triangles,
+	const ptTriangle_t* triangles,
 	const int* sortedTriIndices,
-	cudaBVHNode_t* nodes,
+	ptBVHNode_t* nodes,
 	int numPrimitives
 ) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -194,13 +193,31 @@ __global__ void InitLeafNodesKernel(
 
 	// copy bounds with epsilon padding
 	const float EPSILON = 0.001f;
-	const cudaTriangle_t& tri = triangles[triIdx];
+	const ptTriangle_t& tri = triangles[triIdx];
 	nodes[nodeIdx].bounds[0] = tri.bounds[0] - EPSILON;
 	nodes[nodeIdx].bounds[1] = tri.bounds[1] - EPSILON;
 	nodes[nodeIdx].bounds[2] = tri.bounds[2] - EPSILON;
 	nodes[nodeIdx].bounds[3] = tri.bounds[3] + EPSILON;
 	nodes[nodeIdx].bounds[4] = tri.bounds[4] + EPSILON;
 	nodes[nodeIdx].bounds[5] = tri.bounds[5] + EPSILON;
+}
+
+__global__ void BuildEscapeLinksKernel(ptBVHNode_t* nodes, const int* parents, int numNodes) {
+	const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	if (idx >= numNodes) return;
+
+	int child = idx;
+	int parent = parents[child];
+	int escape = -1;
+	while (parent >= 0) {
+		if (nodes[parent].leftChild == child) {
+			escape = nodes[parent].rightChild;
+			break;
+		}
+		child = parent;
+		parent = parents[child];
+	}
+	nodes[idx].escapeIndex = escape;
 }
 
 /*
@@ -210,7 +227,7 @@ Kernel 4: Bottom-Up AABB Propagation
 */
 
 __global__ void ComputeNodeBoundsKernel(
-	cudaBVHNode_t* nodes,
+	ptBVHNode_t* nodes,
 	const int* parents,
 	int* atomicCounters,
 	int numPrimitives
@@ -222,24 +239,34 @@ __global__ void ComputeNodeBoundsKernel(
 	int parent = parents[numPrimitives - 1 + i];
 
 	while (parent >= 0) {
-		// first child to arrive increments 0->1, exits.
-		// second child increments 1->2, proceeds to merge.
+		// publish this subtree's bounds before signalling arrival, otherwise the
+		// sibling thread may merge stale data
+		__threadfence();
+
+		// first child to arrive increments 0->1 and exits,
+		// the second one (1->2) merges both children
 		if (atomicAdd(&atomicCounters[parent], 1) == 0) {
-			return;  // sibling not done yet — exit and let it finish
+			return;
 		}
 
-		// both children ready — compute union AABB
-		int left  = nodes[parent].leftChild;
-		int right = nodes[parent].rightChild;
+		// the sibling's bounds were written by another SM in this launch; bypass
+		// the non-coherent L1 and read them from L2
+		const int left  = __ldcg(&nodes[parent].leftChild);
+		const int right = __ldcg(&nodes[parent].rightChild);
 
-		nodes[parent].bounds[0] = fminf(nodes[left].bounds[0], nodes[right].bounds[0]);
-		nodes[parent].bounds[1] = fminf(nodes[left].bounds[1], nodes[right].bounds[1]);
-		nodes[parent].bounds[2] = fminf(nodes[left].bounds[2], nodes[right].bounds[2]);
-		nodes[parent].bounds[3] = fmaxf(nodes[left].bounds[3], nodes[right].bounds[3]);
-		nodes[parent].bounds[4] = fmaxf(nodes[left].bounds[4], nodes[right].bounds[4]);
-		nodes[parent].bounds[5] = fmaxf(nodes[left].bounds[5], nodes[right].bounds[5]);
+		float lb[6], rb[6];
+		for (int k = 0; k < 6; k++) {
+			lb[k] = __ldcg(&nodes[left].bounds[k]);
+			rb[k] = __ldcg(&nodes[right].bounds[k]);
+		}
 
-		// walk up to grandparent
+		nodes[parent].bounds[0] = fminf(lb[0], rb[0]);
+		nodes[parent].bounds[1] = fminf(lb[1], rb[1]);
+		nodes[parent].bounds[2] = fminf(lb[2], rb[2]);
+		nodes[parent].bounds[3] = fmaxf(lb[3], rb[3]);
+		nodes[parent].bounds[4] = fmaxf(lb[4], rb[4]);
+		nodes[parent].bounds[5] = fmaxf(lb[5], rb[5]);
+
 		parent = parents[parent];
 	}
 }
@@ -251,8 +278,8 @@ Kernel 5: Single-Triangle Fallback
 */
 
 __global__ void InitSingleLeafKernel(
-	const cudaTriangle_t* triangles,
-	cudaBVHNode_t* nodes,
+	const ptTriangle_t* triangles,
+	ptBVHNode_t* nodes,
 	int* triIndices
 ) {
 	if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -263,6 +290,7 @@ __global__ void InitSingleLeafKernel(
 	nodes[0].rightChild = -1;
 	nodes[0].firstPrimitive = 0;
 	nodes[0].primitiveCount = 1;
+	nodes[0].escapeIndex = -1;
 
 	const float EPSILON = 0.001f;
 	nodes[0].bounds[0] = triangles[0].bounds[0] - EPSILON;
@@ -273,22 +301,42 @@ __global__ void InitSingleLeafKernel(
 	nodes[0].bounds[5] = triangles[0].bounds[5] + EPSILON;
 }
 
+// morton3D produces 30 bit codes, the radix sort can skip the top two bits
+#define LBVH_MORTON_BITS	30
+
+/*
+================================================================================
+LBVHSortTempBytes
+================================================================================
+*/
+extern "C" size_t LBVHSortTempBytes(int numTriangles) {
+	if (numTriangles <= 1) return 0;
+	size_t bytes = 0;
+	cub::DoubleBuffer<unsigned int> keys(NULL, NULL);
+	cub::DoubleBuffer<int> vals(NULL, NULL);
+	cub::DeviceRadixSort::SortPairs(NULL, bytes, keys, vals, numTriangles, 0, LBVH_MORTON_BITS);
+	return bytes;
+}
+
 /*
 ================================================================================
 Launch Wrapper: LaunchBuildLBVH
 
-All work stays on the GPU. The host only provides scene bounds
-(computed from h_triangles on CPU, which is cheap for <100K tris).
+All work stays on the GPU and is ordered on 'stream'. The host only
+provides the scene bounds (computed by idPathTracerScene).
 ================================================================================
 */
 
 extern "C" void LaunchBuildLBVH(
-	const cudaTriangle_t* d_triangles,
+	const ptTriangle_t* d_triangles,
 	int numTriangles,
-	cudaBVHNode_t* d_bvhNodes,
+	ptBVHNode_t* d_bvhNodes,
 	int* d_triIndices,
 	unsigned int* d_mortonCodes,
+	unsigned int* d_mortonAlt,
 	int* d_sortedIndices,
+	void* d_sortTemp,
+	size_t sortTempBytes,
 	int* d_parents,
 	int* d_atomicCounters,
 	const float* sceneBounds,
@@ -324,19 +372,16 @@ extern "C" void LaunchBuildLBVH(
 		invExt[0], invExt[1], invExt[2]
 	);
 
-	// parallel radix sort by Morton code
-	cudaStreamSynchronize(stream);
+	// radix sort by Morton code on our stream, using the backend's persistent scratch
+	// buffer (thrust allocated and freed temporary storage on every build)
+	cub::DoubleBuffer<unsigned int> keys(d_mortonCodes, d_mortonAlt);
+	cub::DoubleBuffer<int> vals(d_sortedIndices, d_triIndices);
+	cub::DeviceRadixSort::SortPairs(d_sortTemp, sortTempBytes, keys, vals, numTriangles, 0, LBVH_MORTON_BITS, stream);
 
-	thrust::device_ptr<unsigned int> keys(d_mortonCodes);
-	thrust::device_ptr<int> vals(d_sortedIndices);
-	thrust::sort_by_key(keys, keys + numTriangles, vals);
-
-	// sync default stream before continuing on our stream
-	cudaDeviceSynchronize();
-
-	// copy sorted indices -> triIndices
-	cudaMemcpyAsync(d_triIndices, d_sortedIndices,
-		numTriangles * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+	const unsigned int* sortedCodes = keys.Current();
+	if (vals.Current() != d_triIndices) {
+		cudaMemcpyAsync(d_triIndices, vals.Current(), numTriangles * sizeof(int), cudaMemcpyDeviceToDevice, stream);
+	}
 
 	// initialize parent array to -1
 	cudaMemsetAsync(d_parents, 0xFF, numNodes * sizeof(int), stream);
@@ -347,13 +392,16 @@ extern "C" void LaunchBuildLBVH(
 	// build radix tree topology
 	int treeGrid = (numInternalNodes + BLOCK - 1) / BLOCK;
 	BuildRadixTreeKernel<<<treeGrid, BLOCK, 0, stream>>>(
-		d_mortonCodes, numTriangles, d_bvhNodes, d_parents
+		sortedCodes, numTriangles, d_bvhNodes, d_parents
 	);
 
 	// initialize leaf nodes
 	InitLeafNodesKernel<<<grid, BLOCK, 0, stream>>>(
 		d_triangles, d_triIndices, d_bvhNodes, numTriangles
 	);
+
+	const int nodeGrid = (numNodes + BLOCK - 1) / BLOCK;
+	BuildEscapeLinksKernel<<<nodeGrid, BLOCK, 0, stream>>>(d_bvhNodes, d_parents, numNodes);
 
 	// bottom-up AABB propagation
 	ComputeNodeBoundsKernel<<<grid, BLOCK, 0, stream>>>(

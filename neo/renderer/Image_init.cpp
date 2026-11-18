@@ -32,6 +32,9 @@ If you have questions concerning this license or the applicable additional terms
 #include "renderer/tr_local.h"
 
 #include "renderer/Image.h"
+#ifdef HAVE_PATHTRACER
+#include "renderer_pt/pt_render.h"
+#endif
 
 #include "framework/GameCallbacks_local.h"
 
@@ -1117,6 +1120,9 @@ void R_ReloadImages_f( const idCmdArgs &args ) {
 		image = globalImages->images[ i ];
 		image->Reload( checkPrecompressed, all );
 	}
+#ifdef HAVE_PATHTRACER
+	RB_PT_InvalidateImages();
+#endif
 }
 
 typedef struct {
